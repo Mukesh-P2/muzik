@@ -1,0 +1,45 @@
+# Android / Gradle
+.gradle/
+.kotlin/
+**/build/
+android/local.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+key.properties
+keystore.properties
+
+# Node
+node_modules/
+server/dist/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.idea/
+.vscode/
+*.iml
+*.log
+*.hprof
+.DS_Store
+Thumbs.db
+
+# Local development assistants
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.agents/
+.codex/
+.claude/
+.gemini/
+.cursor/
+.cursorrules
+.continue/
+.windsurf/
+.aider*

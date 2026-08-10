@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+    <style>
+        html, body, #player { width: 100%; height: 100%; margin: 0; background: #000; overflow: hidden; }
+    </style>
+</head>
+<body>
+<div id="player"></div>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+    let player = null;
+    let ready = false;
+
+    function onYouTubeIframeAPIReady() {
+        player = new YT.Player('player', {
+            width: '100%',
+            height: '100%',
+            playerVars: {
+                enablejsapi: 1,
+                playsinline: 1,
+                rel: 0,
+                origin: 'https://com.muzik.app'
+            },
+            events: {
+                onReady: function () {
+                    ready = true;
+                    AndroidPlayer.onReady();
+                },
+                onStateChange: function (event) {
+                    const position = safePosition();
+                    AndroidPlayer.onStateChanged(event.data, position, safeDuration());
+                },
+                onError: function (event) {
+                    AndroidPlayer.onError(event.data);
+                },
+                onAutoplayBlocked: function () {
+                    AndroidPlayer.onAutoplayBlocked();
+                }
+            }
+        });
+    }
+
+    function safePosition() {
+        try { return player && player.getCurrentTime ? player.getCurrentTime() : 0; }
+        catch (_) { return 0; }
+    }
+
+    function safeDuration() {
+        try { return player && player.getDuration ? player.getDuration() : 0; }
+        catch (_) { return 0; }
+    }
+
+    window.MuzikPlayer = {
+        cue: function (videoId, seconds) {
+            if (ready) player.cueVideoById({videoId: videoId, startSeconds: Math.max(0, seconds)});
+        },
+        load: function (videoId, seconds) {
+            if (ready) player.loadVideoById({videoId: videoId, startSeconds: Math.max(0, seconds)});
+        },
+        play: function () { if (ready) player.playVideo(); },
+        pause: function () { if (ready) player.pauseVideo(); },
+        stop: function () { if (ready) player.stopVideo(); },
+        seek: function (seconds) { if (ready) player.seekTo(Math.max(0, seconds), true); },
+        setQuality: function (quality) {
+            if (ready && player && player.setPlaybackQuality) {
+                try { player.setPlaybackQuality(quality || 'default'); }
+                catch (_) {}
+            }
+        },
+        reportPosition: function () {
+            AndroidPlayer.onPosition(safePosition(), safeDuration());
+        }
+    };
+</script>
+</body>
+</html>
