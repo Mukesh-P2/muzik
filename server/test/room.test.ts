@@ -132,6 +132,21 @@ describe("Room", () => {
     assert.equal(room.playback.video?.title, "Popular");
   });
 
+  it("lets only the host clear the queued items", () => {
+    const room = new Room("ABC123");
+    const host = room.addMember("Host", true);
+    const guest = room.addMember("Guest");
+    room.addToQueue(host.id, video("aaaaaaaaaaa", "First"));
+    room.addToQueue(guest.id, video("bbbbbbbbbbb", "Second"));
+
+    assert.throws(
+      () => room.clearQueue(guest.id),
+      (error) => error instanceof RoomError && error.statusCode === 403,
+    );
+    room.clearQueue(host.id);
+    assert.equal(room.publicStateFor(host.id).queue.length, 0);
+  });
+
   it("rejects playback control from a non-host", () => {
     const room = new Room("ABC123");
     room.addMember("Host", true);
@@ -532,6 +547,87 @@ describe("Room", () => {
     assert.equal(room.publicStateFor(guest.id, 43_000).pauseVote, undefined);
   });
 
+  it("supports bounded chat with host deletion and member muting", () => {
+    const room = new Room("ABC123");
+    const host = room.addMember("Host", true);
+    const guest = room.addMember("Guest");
+    room.setConnected(host.id, true, 100);
+    room.setConnected(guest.id, true, 100);
+
+    const first = room.sendChat(guest.id, "  Hello room  ", 1_000);
+    assert.equal(first.text, "Hello room");
+    assert.equal(room.publicStateFor(host.id, 1_000).chat[0]?.displayName, "Guest");
+    assert.throws(
+      () => room.sendChat(guest.id, "Too fast", 1_100),
+      (error) => error instanceof RoomError && error.statusCode === 429,
+    );
+
+    assert.throws(
+      () => room.setChatMuted(guest.id, host.id, true, 2_000),
+      (error) => error instanceof RoomError && error.statusCode === 403,
+    );
+    room.setChatMuted(host.id, guest.id, true, 2_000);
+    assert.equal(
+      room.publicStateFor(host.id, 2_000).members.find((member) => member.id === guest.id)
+        ?.chatMuted,
+      true,
+    );
+    assert.throws(
+      () => room.sendChat(guest.id, "Muted", 3_000),
+      (error) => error instanceof RoomError && error.statusCode === 403,
+    );
+    room.setChatMuted(host.id, guest.id, false, 3_000);
+
+    assert.throws(
+      () => room.deleteChatMessage(guest.id, first.id, 4_000),
+      (error) => error instanceof RoomError && error.statusCode === 403,
+    );
+    room.deleteChatMessage(host.id, first.id, 4_000);
+    assert.equal(room.publicStateFor(host.id, 4_000).chat.length, 0);
+
+    for (let index = 0; index < 101; index += 1) {
+      room.sendChat(host.id, `Message ${index}`, 5_000 + index * 1_000);
+    }
+    const boundedChat = room.publicStateFor(host.id, 200_000).chat;
+    assert.equal(boundedChat.length, 100);
+    assert.equal(boundedChat[0]?.text, "Message 1");
+    assert.equal(boundedChat.at(-1)?.text, "Message 100");
+  });
+
+  it("round-trips durable room state while resetting process-local presence", () => {
+    const room = new Room("ABC123");
+    const host = room.addMember("Host", true);
+    const guest = room.addMember("Guest");
+    room.setConnected(host.id, true, 100);
+    room.setConnected(guest.id, true, 100);
+    const current = room.addToQueue(host.id, video("aaaaaaaaaaa", "Current"));
+    room.playQueueItem(host.id, current.id, 1_000);
+    const queued = room.addToQueue(guest.id, video("bbbbbbbbbbb", "Queued"));
+    room.forcePlayNext(host.id, queued.id);
+    room.sendChat(guest.id, "Persist me", 2_000);
+    room.setChatMuted(host.id, guest.id, true, 3_000);
+
+    const serialized = JSON.parse(JSON.stringify(room.toStoredState())) as unknown;
+    const restored = Room.fromStoredState(serialized);
+
+    assert.equal(restored.authenticate(host.id, host.token).displayName, "Host");
+    const state = restored.publicStateFor(host.id, 4_000);
+    assert.equal(state.members.every((member) => member.connected === false), true);
+    assert.equal(state.playback.video?.title, "Current");
+    assert.equal(state.queue[0]?.video.title, "Queued");
+    assert.equal(state.queue[0]?.isForcedNext, true);
+    assert.equal(state.chat[0]?.text, "Persist me");
+    assert.equal(
+      state.members.find((member) => member.id === guest.id)?.chatMuted,
+      true,
+    );
+
+    restored.setConnected(host.id, true, 4_100);
+    restored.control(host.id, "next", undefined, 5_000);
+    assert.equal(restored.playback.video?.title, "Queued");
+    assert.equal(restored.history[0]?.video.title, "Current");
+  });
+
   it("removes a disconnected member's skip vote", () => {
     const room = new Room("ABC123");
     const host = room.addMember("Host", true);
@@ -609,5 +705,28 @@ describe("RoomManager", () => {
     assert.deepEqual(rooms.expirePauseVotes(12_000), [room.code]);
     assert.equal(room.playback.status, "paused");
     assert.deepEqual(rooms.expirePauseVotes(12_000), []);
+  });
+
+  it("emits persistence hooks for room changes and pruning", () => {
+    const changed: string[] = [];
+    const deleted: string[] = [];
+    const rooms = new RoomManager({
+      onRoomChanged: (room) => changed.push(room.code),
+      onRoomDeleted: (code) => deleted.push(code),
+    });
+    const created = rooms.createRoom("Host");
+    assert.ok(changed.includes(created.room.code));
+    created.room.lastActivityAt = 1_000;
+
+    assert.deepEqual(rooms.pruneInactiveRooms(5_000, 10_000), [created.room.code]);
+    assert.deepEqual(deleted, [created.room.code]);
+  });
+
+  it("rejects malformed persisted rooms", () => {
+    const rooms = new RoomManager();
+    assert.throws(
+      () => rooms.restoreRoom({ version: 1, code: "BAD" }),
+      (error) => error instanceof RoomError && error.message === "Invalid stored room state",
+    );
   });
 });

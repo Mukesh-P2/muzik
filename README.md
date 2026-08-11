@@ -19,6 +19,8 @@ specific song to play next, and remove queue items. Members can add and vote on
 songs, request a pause, and vote to skip. The app also supports listening
 history, contributor attribution, automatic playback of the first host-added
 song, reconnect handling, host handoff, and Android picture-in-picture.
+Rooms also include bounded chat with host message deletion and member muting,
+YouTube playlist import, and a host action to clear the queued items.
 
 ## Repository structure
 
@@ -30,7 +32,7 @@ song, reconnect handling, host handoff, and Android picture-in-picture.
 
 ## Requirements
 
-- Node.js 18.18 or newer and npm
+- Node.js 18.19 or newer and npm
 - Android Studio with Android SDK Platform 35
 - Java 17 or 21 for Gradle
 - Android 8.0/API 26 or newer
@@ -44,6 +46,7 @@ Create `server/.env` from `server/.env.example` and configure:
 PORT=8080
 YOUTUBE_API_KEY=your_server_side_youtube_api_key
 ALLOWED_ORIGIN=*
+REDIS_URL=redis://default:password@host:6379
 ```
 
 | Variable | Required | Purpose |
@@ -51,6 +54,7 @@ ALLOWED_ORIGIN=*
 | `PORT` | No | HTTP/WebSocket port; defaults to `8080` |
 | `YOUTUBE_API_KEY` | For search | Server-only YouTube Data API credential |
 | `ALLOWED_ORIGIN` | No | Allowed HTTP origin |
+| `REDIS_URL` | No | Redis connection URL for durable room state; memory-only when omitted |
 
 Keep `.env`, API keys, and credentials out of source control. The YouTube key
 must remain on the server and must never be compiled into the APK.
@@ -65,9 +69,10 @@ npm run typecheck
 npm run build
 ```
 
-The health endpoint is available at `/health`. Room creation and synchronized
-playback work without a YouTube key, but search will report that it is not
-configured.
+The health endpoint is available at `/health`, and Prometheus-compatible runtime
+gauges are available at `/metrics`. Room creation and synchronized playback work
+without a YouTube key, but search and playlist import will report that they are
+not configured.
 
 ## Android configuration
 
@@ -99,6 +104,25 @@ On Windows, use `gradlew.bat`. Debug APKs are written under
 `android/app/build/outputs/apk/debug/`. Public releases require a signing key
 stored outside the repository.
 
+### Release signing
+
+Release signing is optional for local and CI verification builds. Without
+credentials, `assembleRelease` produces an unsigned APK. A distributable build
+requires all four of these values, supplied as environment variables or in the
+user-level Gradle properties file (`~/.gradle/gradle.properties`), never in this
+repository:
+
+```properties
+MUZIK_RELEASE_STORE_FILE=/absolute/path/outside/the/repository/muzik-release.jks
+MUZIK_RELEASE_STORE_PASSWORD=replace-with-secret
+MUZIK_RELEASE_KEY_ALIAS=muzik
+MUZIK_RELEASE_KEY_PASSWORD=replace-with-secret
+```
+
+Gradle fails early if only some signing values are present. Protect and back up
+the keystore and passwords separately; losing the signing key can prevent
+updates to an installed production application.
+
 ## Protocol compatibility
 
 Shared changes must remain backward-compatible with installed APKs. Snapshot
@@ -119,8 +143,9 @@ sends them is distributed; otherwise that APK receives `Unknown message type`.
 ## Production constraints
 
 - Render automatically deploys pushes to the configured production branch.
-- Room state is currently held in memory, so any server restart or deployment
-  clears all active rooms.
+- Room state is memory-only when `REDIS_URL` is absent, so a restart or
+  deployment then clears all active rooms. With Redis configured, room data is
+  restored while live presence is reset until clients reconnect.
 - Render must receive `YOUTUBE_API_KEY` through its secret environment settings.
 - A server URL change requires a newly built APK.
 - Signing credentials, local properties, and environment files must not be
@@ -136,4 +161,7 @@ advertisements, or implement background audio playback.
 
 See [architecture.md](docs/architecture.md) for implementation details and
 [youtube-compliance.md](docs/youtube-compliance.md) for the full compliance
-constraints.
+constraints. Release drafts for the [privacy policy](docs/privacy-policy.md),
+[terms of service](docs/terms-of-service.md), and
+[community and moderation rules](docs/community-and-moderation.md) must have
+their marked placeholders resolved and be reviewed and published before launch.

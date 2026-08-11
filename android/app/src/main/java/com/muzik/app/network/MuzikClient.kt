@@ -62,5 +62,13 @@ class MuzikClient(
             header("X-Member-Token", membership.memberToken)
         }.body()
 
+    suspend fun importPlaylist(value: String, membership: Membership): SearchResponse =
+        http.get("$baseUrl/api/youtube/playlist") {
+            url { parameters.append("value", value.trim()) }
+            header("X-Room-Code", membership.roomCode)
+            header("X-Member-Id", membership.memberId)
+            header("X-Member-Token", membership.memberToken)
+        }.body()
+
     fun close() = http.close()
 }

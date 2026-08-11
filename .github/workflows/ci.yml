@@ -38,4 +38,4 @@ jobs:
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew lintDebug testDebugUnitTest assembleDebug assembleRelease
+          ./gradlew lintDebug testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease

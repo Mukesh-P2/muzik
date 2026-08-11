@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  fetchYouTubePlaylistVideos,
   fetchYouTubeSearchResults,
   parseIso8601DurationMs,
+  parseYouTubePlaylistId,
   YouTubeSearchError,
 } from "../src/youtube.js";
 
@@ -33,6 +35,83 @@ describe("YouTube durations", () => {
     ]) {
       assert.equal(parseIso8601DurationMs(value), undefined, String(value));
     }
+  });
+});
+
+describe("YouTube playlist import", () => {
+  it("parses playlist URLs and raw IDs without accepting unrelated hosts", () => {
+    assert.equal(parseYouTubePlaylistId("PL1234567890"), "PL1234567890");
+    assert.equal(
+      parseYouTubePlaylistId("https://www.youtube.com/playlist?list=PL1234567890"),
+      "PL1234567890",
+    );
+    assert.equal(
+      parseYouTubePlaylistId("https://music.youtube.com/playlist?list=PL1234567890"),
+      "PL1234567890",
+    );
+    assert.equal(
+      parseYouTubePlaylistId("https://example.test/playlist?list=PL1234567890"),
+      undefined,
+    );
+    assert.equal(parseYouTubePlaylistId("not a playlist"), undefined);
+  });
+
+  it("preserves playlist order and filters videos that cannot be embedded", async () => {
+    const requested: URL[] = [];
+    const results = await fetchYouTubePlaylistVideos("PL1234567890", "test-key", {
+      fetcher: async (input): Promise<Response> => {
+        const url = new URL(input);
+        requested.push(url);
+        if (url.pathname.endsWith("/playlistItems")) {
+          return jsonResponse({
+            items: [
+              { contentDetails: { videoId: "bbbbbbbbbbb" } },
+              { contentDetails: { videoId: "aaaaaaaaaaa" } },
+              { contentDetails: { videoId: "ccccccccccc" } },
+            ],
+          });
+        }
+        return jsonResponse({
+          items: [
+            {
+              id: "aaaaaaaaaaa",
+              snippet: {
+                title: "First &amp; available",
+                channelTitle: "Channel A",
+                thumbnails: { medium: { url: "https://example.test/a.jpg" } },
+              },
+              contentDetails: { duration: "PT2M5S" },
+              status: { embeddable: true },
+            },
+            {
+              id: "bbbbbbbbbbb",
+              snippet: {
+                title: "Second in response, first in playlist",
+                channelTitle: "Channel B",
+                thumbnails: {},
+              },
+              contentDetails: { duration: "PT1M" },
+              status: { embeddable: true },
+            },
+            {
+              id: "ccccccccccc",
+              snippet: { title: "Blocked", channelTitle: "Channel C", thumbnails: {} },
+              contentDetails: { duration: "PT3M" },
+              status: { embeddable: false },
+            },
+          ],
+        });
+      },
+    });
+
+    assert.deepEqual(results.map((result) => result.videoId), [
+      "bbbbbbbbbbb",
+      "aaaaaaaaaaa",
+    ]);
+    assert.equal(results[0]?.durationMs, 60_000);
+    assert.equal(results[1]?.title, "First & available");
+    assert.equal(requested[0]?.searchParams.get("maxResults"), "50");
+    assert.equal(requested[1]?.searchParams.get("part"), "snippet,contentDetails,status");
   });
 });
 

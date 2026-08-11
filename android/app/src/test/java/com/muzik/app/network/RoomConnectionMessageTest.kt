@@ -3,6 +3,7 @@ package com.muzik.app.network
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RoomConnectionMessageTest {
@@ -42,5 +43,18 @@ class RoomConnectionMessageTest {
         assertEquals("yes", yes["vote"]?.jsonPrimitive?.content)
         assertEquals("no", no["vote"]?.jsonPrimitive?.content)
         assertEquals("poll-1", yes["pollId"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun chatMessagesCarryTextAndModerationTargets() {
+        val send = chatSendMessage("Hello")
+        val delete = chatDeleteMessage("message-1")
+        val mute = chatMuteMessage("member-2", true)
+
+        assertEquals("chat_send", send["type"]?.jsonPrimitive?.content)
+        assertEquals("Hello", send["text"]?.jsonPrimitive?.content)
+        assertEquals("message-1", delete["messageId"]?.jsonPrimitive?.content)
+        assertEquals("member-2", mute["memberId"]?.jsonPrimitive?.content)
+        assertTrue(mute["muted"]?.jsonPrimitive?.content?.toBoolean() == true)
     }
 }

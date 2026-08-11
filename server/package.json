@@ -11,9 +11,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "engines": {
-    "node": ">=18.18"
+    "node": ">=18.19"
   },
   "dependencies": {
+    "redis": "^5.12.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {

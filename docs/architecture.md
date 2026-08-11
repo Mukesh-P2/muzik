@@ -85,8 +85,12 @@ clock pings every five seconds. The server sends WebSocket heartbeat frames and
 terminates dead connections so presence and host handoff recover after abrupt
 disconnects.
 
-Membership is currently held in Android memory. Leaving the room or the Android
-process being destroyed requires joining again.
+Android stores the current membership credential in private, backup-excluded
+app preferences. After a process restart, the app restores the room screen and
+reconnects automatically. Explicitly leaving clears the stored credential. If
+the server room expired or was erased while Redis persistence was disabled, the
+restored room cannot reconnect and the user can leave it and join or create
+another.
 
 ## 5. HTTP API
 
@@ -94,9 +98,11 @@ process being destroyed requires joining again.
 |---|---|---|
 | `GET /` | Service identity/status | None |
 | `GET /health` | Render health check | None |
+| `GET /metrics` | Prometheus-compatible runtime gauges | None |
 | `POST /api/rooms` | Create a room | None |
 | `POST /api/rooms/{code}/join` | Join a room | None |
 | `GET /api/youtube/search?q=...` | Search embeddable videos | Room headers |
+| `GET /api/youtube/playlist?value=...` | Import up to 50 embeddable playlist videos | Room headers |
 
 Authenticated requests use `X-Room-Code`, `X-Member-Id`, and
 `X-Member-Token`. HTTP bodies are limited to 32 KB. General and search-specific
@@ -115,6 +121,7 @@ Android-to-server messages:
 | `ping` | Clock-offset sample request |
 | `request_snapshot` | Request current room state |
 | `queue_add` | Add a validated YouTube video summary |
+| `queue_clear` | Host removes every queued item without stopping playback |
 | `queue_vote` | Add or remove the member's queue vote |
 | `queue_remove` | Host removes an item |
 | `queue_reorder` | Host reorders an item within an equal-vote tier |
@@ -124,6 +131,9 @@ Android-to-server messages:
 | `pause_request` | Member opens a pause vote, or pauses immediately when they are the only capable online client |
 | `pause_vote` | Capable client votes yes or no in the current pause poll |
 | `skip_vote` | Member votes to advance to the next item |
+| `chat_send` | Add a bounded room-chat message |
+| `chat_delete` | Host deletes a room-chat message |
+| `chat_mute` | Host mutes or unmutes a member in room chat |
 | `leave_room` | Explicitly remove the member and their votes from the room |
 
 Server-to-Android messages:
@@ -153,6 +163,11 @@ limit.
    minutes; partial results use a short cache so enrichment can recover.
 6. A member adds a result to the shared queue. Only the YouTube ID and display
    metadata are stored; no media passes through the Muzik server.
+
+Playlist import accepts a YouTube playlist URL or ID, loads at most the first 50
+items through the official Data API, filters out videos that are unavailable or
+not embeddable, preserves playlist order, removes room duplicates, and respects
+the 100-item queue limit.
 
 `YOUTUBE_API_KEY` exists only on the server. It is never compiled into the APK.
 YouTube search consumes Data API quota, so production usage needs quota
@@ -266,6 +281,8 @@ elected, preventing an unusable room.
 - Official visible YouTube playback.
 - Server-side embeddable-video search.
 - Shared ranked queue with per-user votes.
+- YouTube playlist import and host queue clearing.
+- Bounded room chat with host deletion and participant muting.
 - Host play-now, remove, play, pause, seek, and next controls.
 - Seek/progress display populated by the official player.
 - Majority skip voting for non-host members.
@@ -275,19 +292,25 @@ elected, preventing an unusable room.
 
 ## 11. Server memory and lifecycle
 
-Rooms are stored in the Node process. Disconnected rooms are pruned after six
-hours of inactivity to prevent unbounded memory growth. Render Free can stop or
-restart a service, which immediately removes all rooms because there is no
-database.
+Rooms always operate in the Node process. When `REDIS_URL` is configured, each
+mutation also stores a versioned room record in Redis and startup restores room
+membership credentials, queue votes, playback, history, and chat. Connection
+presence and in-progress pause/skip votes reset safely; clients establish fresh
+presence when they reconnect. Without `REDIS_URL`, a restart or deployment
+removes every room.
+
+Disconnected rooms are pruned after six hours of inactivity to prevent
+unbounded growth, and their Redis record is deleted at the same time.
 
 An explicit leave removes the membership and its queue/skip votes. An accidental
-disconnect keeps the membership in memory so the same token can reconnect and
-resume the session.
+disconnect keeps the membership so the same token can reconnect and resume the
+session.
 
 This is suitable for an MVP where rooms are temporary. Durable production
 architecture should use:
 
-- Redis for room snapshots, presence expiry, and multi-instance fan-out.
+- Redis pub/sub for multi-instance fan-out (single-instance persistence is
+  already supported).
 - PostgreSQL for accounts, moderation, and durable history.
 - Signed short-lived access tokens for registered accounts.
 

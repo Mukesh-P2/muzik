@@ -23,7 +23,9 @@ import com.muzik.app.ui.MuzikApp
 import com.muzik.app.ui.MuzikTheme
 
 class MainActivity : ComponentActivity() {
-    private val viewModel: MuzikViewModel by viewModels()
+    private val viewModel: MuzikViewModel by viewModels {
+        MuzikViewModel.Factory(applicationContext)
+    }
     private var pictureInPictureMode by mutableStateOf(false)
     private var pictureInPictureSourceRect: Rect? = null
 

@@ -49,6 +49,14 @@ export interface HistoryItem {
   playedAt: number;
 }
 
+export interface ChatMessage {
+  id: string;
+  memberId: string;
+  displayName: string;
+  text: string;
+  sentAt: number;
+}
+
 export interface PublicQueueItem {
   id: string;
   video: VideoSummary;

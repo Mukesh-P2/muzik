@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import type {
+  ChatMessage,
   HistoryItem,
   Member,
   PauseVoteChoice,
@@ -14,6 +15,9 @@ const PLAY_LEAD_MS = 1_200;
 const CONTROL_LEAD_MS = 500;
 const MAX_QUEUE_ITEMS = 100;
 const MAX_HISTORY_ITEMS = 50;
+const MAX_CHAT_MESSAGES = 100;
+const MAX_CHAT_MESSAGE_LENGTH = 500;
+const CHAT_COOLDOWN_MS = 750;
 const MAX_POSITION_MS = 24 * 60 * 60 * 1_000;
 const PAUSE_VOTE_TTL_MS = 10_000;
 
@@ -24,6 +28,22 @@ interface PauseVote {
   votes: Map<string, PauseVoteChoice>;
   startedAt: number;
   expiresAt: number;
+}
+
+export interface StoredRoomStateV1 {
+  version: 1;
+  code: string;
+  createdAt: number;
+  lastActivityAt: number;
+  members: Member[];
+  queue: Array<Omit<QueueItem, "votes"> & { votes: string[] }>;
+  history: HistoryItem[];
+  chat: ChatMessage[];
+  playback: PlaybackState;
+  currentPlaybackItem?: HistoryItem;
+  forcedNextItemId?: string;
+  mutedMemberIds: string[];
+  nextOrderKey: number;
 }
 
 export class RoomError extends Error {
@@ -39,12 +59,15 @@ export class Room {
   readonly members = new Map<string, Member>();
   readonly queue = new Map<string, QueueItem>();
   readonly history: HistoryItem[] = [];
+  readonly chat: ChatMessage[] = [];
   readonly skipVotes = new Set<string>();
-  readonly createdAt = Date.now();
-  lastActivityAt = this.createdAt;
+  readonly createdAt: number;
+  lastActivityAt: number;
   private currentPlaybackItem: HistoryItem | undefined;
   private forcedNextItemId: string | undefined;
   private pauseVote: PauseVote | undefined;
+  private readonly mutedMemberIds = new Set<string>();
+  private readonly lastChatAt = new Map<string, number>();
   private nextOrderKey = 0;
 
   playback: PlaybackState = {
@@ -55,7 +78,77 @@ export class Room {
     revision: 0,
   };
 
-  constructor(readonly code: string) {}
+  constructor(
+    readonly code: string,
+    private readonly onChange: (room: Room) => void = () => {},
+    createdAt = Date.now(),
+  ) {
+    this.createdAt = createdAt;
+    this.lastActivityAt = createdAt;
+    this.playback.anchorServerTimeMs = createdAt;
+  }
+
+  static fromStoredState(
+    value: unknown,
+    onChange: (room: Room) => void = () => {},
+  ): Room {
+    if (!isStoredRoomState(value)) throw new RoomError("Invalid stored room state");
+    const room = new Room(value.code, onChange, value.createdAt);
+    room.lastActivityAt = value.lastActivityAt;
+    for (const member of value.members) {
+      room.members.set(member.id, {
+        ...member,
+        connected: false,
+        pauseVoteCapable: false,
+      });
+    }
+    for (const item of value.queue) {
+      room.queue.set(item.id, {
+        ...item,
+        video: validateVideo(item.video),
+        votes: new Set(item.votes.filter((memberId) => room.members.has(memberId))),
+      });
+    }
+    room.history.push(...value.history);
+    room.chat.push(...value.chat.slice(-MAX_CHAT_MESSAGES));
+    room.playback = value.playback;
+    room.currentPlaybackItem = value.currentPlaybackItem;
+    room.forcedNextItemId = value.forcedNextItemId && room.queue.has(value.forcedNextItemId)
+      ? value.forcedNextItemId
+      : undefined;
+    for (const memberId of value.mutedMemberIds) {
+      if (room.members.has(memberId)) room.mutedMemberIds.add(memberId);
+    }
+    room.nextOrderKey = Math.max(
+      value.nextOrderKey,
+      ...[...room.queue.values()].map((item) => item.orderKey + 1),
+      0,
+    );
+    return room;
+  }
+
+  toStoredState(): StoredRoomStateV1 {
+    return {
+      version: 1,
+      code: this.code,
+      createdAt: this.createdAt,
+      lastActivityAt: this.lastActivityAt,
+      members: [...this.members.values()],
+      queue: [...this.queue.values()].map((item) => ({
+        ...item,
+        votes: [...item.votes],
+      })),
+      history: this.history,
+      chat: this.chat,
+      playback: this.playback,
+      ...(this.currentPlaybackItem
+        ? { currentPlaybackItem: this.currentPlaybackItem }
+        : {}),
+      ...(this.forcedNextItemId ? { forcedNextItemId: this.forcedNextItemId } : {}),
+      mutedMemberIds: [...this.mutedMemberIds],
+      nextOrderKey: this.nextOrderKey,
+    };
+  }
 
   addMember(displayName: string, isHost = false): Member {
     const normalizedName = displayName.trim().slice(0, 40);
@@ -93,6 +186,8 @@ export class Room {
     const member = this.requireMember(memberId);
     this.members.delete(memberId);
     this.skipVotes.delete(memberId);
+    this.mutedMemberIds.delete(memberId);
+    this.lastChatAt.delete(memberId);
     for (const item of this.queue.values()) item.votes.delete(memberId);
     if (this.pauseVote?.requestedBy === memberId) this.pauseVote = undefined;
     else this.pauseVote?.votes.delete(memberId);
@@ -158,12 +253,68 @@ export class Room {
     this.touch();
   }
 
+  sendChat(memberId: string, text: string, now = Date.now()): ChatMessage {
+    const member = this.requireMember(memberId);
+    if (!member.connected) throw new RoomError("Only connected members can chat", 409);
+    if (this.mutedMemberIds.has(memberId)) {
+      throw new RoomError("The host muted your room chat", 403);
+    }
+    const normalizedText = String(text ?? "").trim().slice(0, MAX_CHAT_MESSAGE_LENGTH);
+    if (!normalizedText) throw new RoomError("Chat message is required");
+    const lastSentAt = this.lastChatAt.get(memberId);
+    if (lastSentAt !== undefined && now - lastSentAt < CHAT_COOLDOWN_MS) {
+      throw new RoomError("Please wait before sending another message", 429);
+    }
+
+    const message: ChatMessage = {
+      id: randomUUID(),
+      memberId,
+      displayName: member.displayName,
+      text: normalizedText,
+      sentAt: now,
+    };
+    this.chat.push(message);
+    if (this.chat.length > MAX_CHAT_MESSAGES) this.chat.shift();
+    this.lastChatAt.set(memberId, now);
+    this.touch(now);
+    return message;
+  }
+
+  deleteChatMessage(memberId: string, messageId: string, now = Date.now()): void {
+    this.requireHost(memberId);
+    const index = this.chat.findIndex((message) => message.id === messageId);
+    if (index < 0) throw new RoomError("Chat message not found", 404);
+    this.chat.splice(index, 1);
+    this.touch(now);
+  }
+
+  setChatMuted(
+    memberId: string,
+    targetMemberId: string,
+    muted: boolean,
+    now = Date.now(),
+  ): void {
+    const host = this.requireHost(memberId);
+    const target = this.requireMember(targetMemberId);
+    if (target.id === host.id) throw new RoomError("The host cannot mute themselves", 409);
+    if (muted) this.mutedMemberIds.add(target.id);
+    else this.mutedMemberIds.delete(target.id);
+    this.touch(now);
+  }
+
   removeQueueItem(memberId: string, itemId: string): void {
     this.requireHost(memberId);
     if (!this.queue.delete(itemId)) {
       throw new RoomError("Queue item not found", 404);
     }
     if (this.forcedNextItemId === itemId) this.forcedNextItemId = undefined;
+    this.touch();
+  }
+
+  clearQueue(memberId: string): void {
+    this.requireHost(memberId);
+    this.queue.clear();
+    this.forcedNextItemId = undefined;
     this.touch();
   }
 
@@ -383,6 +534,7 @@ export class Room {
       isHost: candidate.isHost,
       connected: candidate.connected,
       songsAddedCount: candidate.songsAddedCount,
+      chatMuted: this.mutedMemberIds.has(candidate.id),
     }));
     const queue: PublicQueueItem[] = this.sortedQueue().map((item) => ({
       id: item.id,
@@ -409,6 +561,7 @@ export class Room {
       queue,
       playback: this.playback,
       history: this.history,
+      chat: this.chat,
       ...(pauseVote ? { pauseVote } : {}),
       skip: {
         votes: this.skipVotes.size,
@@ -560,6 +713,7 @@ export class Room {
 
   private touch(now = Date.now()): void {
     this.lastActivityAt = Math.max(this.lastActivityAt, now);
+    this.onChange(this);
   }
 
   private requireMember(memberId: string): Member {
@@ -575,15 +729,22 @@ export class Room {
   }
 }
 
+interface RoomManagerOptions {
+  onRoomChanged?: (room: Room) => void;
+  onRoomDeleted?: (code: string) => void;
+}
+
 export class RoomManager {
   private readonly rooms = new Map<string, Room>();
+
+  constructor(private readonly options: RoomManagerOptions = {}) {}
 
   createRoom(displayName: string): { room: Room; member: Member } {
     let code: string;
     do code = randomBytes(3).toString("hex").toUpperCase();
     while (this.rooms.has(code));
 
-    const room = new Room(code);
+    const room = new Room(code, this.options.onRoomChanged);
     const member = room.addMember(displayName, true);
     this.rooms.set(code, room);
     return { room, member };
@@ -595,11 +756,23 @@ export class RoomManager {
     return room;
   }
 
+  activeRoomCount(): number {
+    return this.rooms.size;
+  }
+
+  restoreRoom(value: unknown): Room {
+    const room = Room.fromStoredState(value, this.options.onRoomChanged);
+    if (this.rooms.has(room.code)) throw new RoomError("Stored room already exists", 409);
+    this.rooms.set(room.code, room);
+    return room;
+  }
+
   pruneInactiveRooms(maxIdleMs: number, now = Date.now()): string[] {
     const removed: string[] = [];
     for (const [code, room] of this.rooms) {
       if (!room.hasConnectedMembers() && now - room.lastActivityAt >= maxIdleMs) {
         this.rooms.delete(code);
+        this.options.onRoomDeleted?.(code);
         removed.push(code);
       }
     }
@@ -613,6 +786,54 @@ export class RoomManager {
     }
     return changedRooms;
   }
+}
+
+function isStoredRoomState(value: unknown): value is StoredRoomStateV1 {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Partial<StoredRoomStateV1>;
+  return state.version === 1 &&
+    typeof state.code === "string" && /^[A-Z0-9]{6,8}$/.test(state.code) &&
+    typeof state.createdAt === "number" && Number.isFinite(state.createdAt) &&
+    typeof state.lastActivityAt === "number" && Number.isFinite(state.lastActivityAt) &&
+    Array.isArray(state.members) &&
+    state.members.every(isStoredMember) &&
+    Array.isArray(state.queue) &&
+    state.queue.every(isStoredQueueItem) &&
+    Array.isArray(state.history) &&
+    Array.isArray(state.chat) &&
+    state.playback !== null && typeof state.playback === "object" &&
+    Array.isArray(state.mutedMemberIds) && state.mutedMemberIds.every(isString) &&
+    typeof state.nextOrderKey === "number" && Number.isFinite(state.nextOrderKey);
+}
+
+function isStoredMember(value: unknown): value is Member {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const member = value as Partial<Member>;
+  return typeof member.id === "string" && member.id.length > 0 &&
+    typeof member.token === "string" && member.token.length > 0 &&
+    typeof member.displayName === "string" && member.displayName.length > 0 &&
+    typeof member.isHost === "boolean" &&
+    typeof member.connected === "boolean" &&
+    typeof member.joinedAt === "number" && Number.isFinite(member.joinedAt) &&
+    typeof member.songsAddedCount === "number" && Number.isFinite(member.songsAddedCount) &&
+    typeof member.pauseVoteCapable === "boolean";
+}
+
+function isStoredQueueItem(
+  value: unknown,
+): value is Omit<QueueItem, "votes"> & { votes: string[] } {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Partial<Omit<QueueItem, "votes"> & { votes: string[] }>;
+  return typeof item.id === "string" && item.id.length > 0 &&
+    item.video !== null && typeof item.video === "object" &&
+    typeof item.addedBy === "string" &&
+    typeof item.addedAt === "number" && Number.isFinite(item.addedAt) &&
+    typeof item.orderKey === "number" && Number.isFinite(item.orderKey) &&
+    Array.isArray(item.votes) && item.votes.every(isString);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
 }
 
 function pauseVoteThreshold(connectedCount: number): number {

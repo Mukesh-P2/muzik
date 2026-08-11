@@ -67,7 +67,9 @@ class VideoMetadataCompatibilityTest {
         )
 
         assertTrue(snapshot.history.isEmpty())
+        assertTrue(snapshot.chat.isEmpty())
         assertEquals(0, snapshot.members.single().songsAddedCount)
+        assertFalse(snapshot.members.single().chatMuted)
         assertNull(snapshot.playback.addedBy)
         assertNull(snapshot.playback.addedByName)
         assertNull(snapshot.pauseVote)
@@ -87,7 +89,8 @@ class VideoMetadataCompatibilityTest {
                       "displayName":"Host",
                       "isHost":true,
                       "connected":true,
-                      "songsAddedCount":3
+                      "songsAddedCount":3,
+                      "chatMuted":true
                     }
                   ],
                   "queue":[
@@ -122,6 +125,15 @@ class VideoMetadataCompatibilityTest {
                       "playedAt":100
                     }
                   ],
+                  "chat":[
+                    {
+                      "id":"chat-1",
+                      "memberId":"member-1",
+                      "displayName":"Host",
+                      "text":"Hello room",
+                      "sentAt":175
+                    }
+                  ],
                   "pauseVote":{
                     "requestedBy":"member-1",
                     "requestedByName":"Host",
@@ -137,9 +149,11 @@ class VideoMetadataCompatibilityTest {
         )
 
         assertEquals(3, snapshot.members.single().songsAddedCount)
+        assertTrue(snapshot.members.single().chatMuted)
         assertTrue(snapshot.queue.single().isForcedNext)
         assertEquals("Host", snapshot.playback.addedByName)
         assertEquals("Previous", snapshot.history.single().video.title)
+        assertEquals("Hello room", snapshot.chat.single().text)
         assertNotNull(snapshot.pauseVote)
         assertEquals("yes", snapshot.pauseVote?.myVote)
         assertEquals(500L, snapshot.pauseVote?.startedAt)

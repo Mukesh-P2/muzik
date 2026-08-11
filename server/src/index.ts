@@ -2,21 +2,53 @@ import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
+import { connectRedisRoomPersistence } from "./persistence.js";
 import { RoomError, RoomManager } from "./room.js";
 import type { VideoSummary } from "./types.js";
-import { fetchYouTubeSearchResults, YouTubeSearchError } from "./youtube.js";
+import {
+  fetchYouTubePlaylistVideos,
+  fetchYouTubeSearchResults,
+  parseYouTubePlaylistId,
+  YouTubeSearchError,
+} from "./youtube.js";
 
 loadLocalEnv();
 
 const port = parsePort(process.env.PORT);
 const allowedOrigin = process.env.ALLOWED_ORIGIN ?? "*";
-const rooms = new RoomManager();
+const roomPersistence = await connectRedisRoomPersistence(process.env.REDIS_URL);
+const rooms = new RoomManager({
+  onRoomChanged: (room) => {
+    void roomPersistence?.saveRoom(room).catch((error) => {
+      console.error(`Unable to persist room ${room.code}:`, safeErrorMessage(error));
+    });
+  },
+  onRoomDeleted: (code) => {
+    void roomPersistence?.deleteRoom(code).catch((error) => {
+      console.error(`Unable to delete persisted room ${code}:`, safeErrorMessage(error));
+    });
+  },
+});
+if (roomPersistence) {
+  let restoredCount = 0;
+  for (const storedRoom of await roomPersistence.loadRooms()) {
+    try {
+      rooms.restoreRoom(storedRoom);
+      restoredCount += 1;
+    } catch (error) {
+      console.warn("Ignoring invalid persisted room:", safeErrorMessage(error));
+    }
+  }
+  console.log(`Restored ${restoredCount} room(s) from Redis`);
+}
 const sockets = new Map<string, Map<string, Set<WebSocket>>>();
 const responsiveSockets = new WeakSet<WebSocket>();
 const pauseVoteCapableSockets = new WeakSet<WebSocket>();
 const searchCache = new Map<string, { expiresAt: number; results: VideoSummary[] }>();
+const playlistCache = new Map<string, { expiresAt: number; results: VideoSummary[] }>();
 const rateLimits = new Map<string, { resetAt: number; count: number }>();
 const ROOM_IDLE_TTL_MS = 6 * 60 * 60 * 1_000;
+const processStartedAt = Date.now();
 
 const server = createServer(async (request, response) => {
   setCors(response);
@@ -29,7 +61,20 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
 
     if (request.method === "GET" && url.pathname === "/health") {
-      sendJson(response, 200, { ok: true, serverTimeMs: Date.now() });
+      const now = Date.now();
+      sendJson(response, 200, {
+        ok: true,
+        serverTimeMs: now,
+        uptimeSeconds: Math.floor((now - processStartedAt) / 1_000),
+        activeRooms: rooms.activeRoomCount(),
+        webSocketConnections: webSockets.clients.size,
+        roomStorage: roomPersistence ? "redis" : "memory",
+      });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/metrics") {
+      sendMetrics(response);
       return;
     }
 
@@ -63,6 +108,17 @@ const server = createServer(async (request, response) => {
       if (query.length < 2) throw new RoomError("Search query is too short");
       if (query.length > 100) throw new RoomError("Search query is too long");
       const results = await searchYouTube(query);
+      sendJson(response, 200, { results });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/youtube/playlist") {
+      authenticateRequest(request);
+      enforceRateLimit(`search:${String(request.headers["x-member-id"] ?? "")}`, 10);
+      const value = (url.searchParams.get("value") ?? "").trim();
+      const playlistId = parseYouTubePlaylistId(value);
+      if (!playlistId) throw new RoomError("Enter a valid YouTube playlist URL or ID");
+      const results = await loadYouTubePlaylist(playlistId);
       sendJson(response, 200, { results });
       return;
     }
@@ -152,8 +208,20 @@ webSockets.on(
 
         if (message.type === "queue_add") {
           room.addToQueue(memberId, message.video as VideoSummary);
+        } else if (message.type === "chat_send") {
+          room.sendChat(memberId, String(message.text ?? ""));
+        } else if (message.type === "chat_delete") {
+          room.deleteChatMessage(memberId, String(message.messageId ?? ""));
+        } else if (message.type === "chat_mute") {
+          room.setChatMuted(
+            memberId,
+            String(message.memberId ?? ""),
+            Boolean(message.muted),
+          );
         } else if (message.type === "queue_vote") {
           room.setVote(memberId, String(message.itemId ?? ""), Boolean(message.enabled));
+        } else if (message.type === "queue_clear") {
+          room.clearQueue(memberId);
         } else if (message.type === "queue_remove") {
           room.removeQueueItem(memberId, String(message.itemId ?? ""));
         } else if (message.type === "queue_reorder") {
@@ -248,6 +316,9 @@ const cleanupTimer = setInterval(() => {
   for (const [key, value] of searchCache) {
     if (value.expiresAt <= now) searchCache.delete(key);
   }
+  for (const [key, value] of playlistCache) {
+    if (value.expiresAt <= now) playlistCache.delete(key);
+  }
 }, 10 * 60_000);
 cleanupTimer.unref();
 
@@ -266,7 +337,10 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     clearInterval(cleanupTimer);
     clearInterval(pauseVoteTimer);
     webSockets.close();
-    server.close(() => process.exit(0));
+    server.close(() => {
+      void roomPersistence?.close().finally(() => process.exit(0));
+      if (!roomPersistence) process.exit(0);
+    });
     setTimeout(() => process.exit(1), 10_000).unref();
   });
 }
@@ -306,6 +380,27 @@ async function searchYouTube(query: string): Promise<VideoSummary[]> {
     ? 10 * 60_000
     : 30_000;
   searchCache.set(cacheKey, { expiresAt: Date.now() + cacheTtlMs, results });
+  return results;
+}
+
+async function loadYouTubePlaylist(playlistId: string): Promise<VideoSummary[]> {
+  const cached = playlistCache.get(playlistId);
+  if (cached && cached.expiresAt > Date.now()) return cached.results;
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  if (!apiKey) throw new RoomError("YouTube playlist import is not configured", 503);
+  let results: VideoSummary[];
+  try {
+    results = await fetchYouTubePlaylistVideos(playlistId, apiKey, {
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (error) {
+    if (error instanceof YouTubeSearchError && error.kind === "unavailable") {
+      throw new RoomError("YouTube playlist import is temporarily unavailable", 502);
+    }
+    throw new RoomError("YouTube playlist import failed", 502);
+  }
+  if (playlistCache.size >= 100) playlistCache.delete(playlistCache.keys().next().value ?? "");
+  playlistCache.set(playlistId, { expiresAt: Date.now() + 10 * 60_000, results });
   return results;
 }
 
@@ -366,6 +461,33 @@ function setCors(response: ServerResponse): void {
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(value));
+}
+
+function sendMetrics(response: ServerResponse): void {
+  const uptimeSeconds = Math.floor((Date.now() - processStartedAt) / 1_000);
+  const lines = [
+    "# HELP muzik_up Whether the Muzik server event loop is serving requests.",
+    "# TYPE muzik_up gauge",
+    "muzik_up 1",
+    "# HELP muzik_uptime_seconds Process uptime in seconds.",
+    "# TYPE muzik_uptime_seconds gauge",
+    `muzik_uptime_seconds ${uptimeSeconds}`,
+    "# HELP muzik_active_rooms Current in-memory room count.",
+    "# TYPE muzik_active_rooms gauge",
+    `muzik_active_rooms ${rooms.activeRoomCount()}`,
+    "# HELP muzik_websocket_connections Current WebSocket connection count.",
+    "# TYPE muzik_websocket_connections gauge",
+    `muzik_websocket_connections ${webSockets.clients.size}`,
+    "# HELP muzik_search_cache_entries Current search cache entry count.",
+    "# TYPE muzik_search_cache_entries gauge",
+    `muzik_search_cache_entries ${searchCache.size}`,
+    "# HELP muzik_playlist_cache_entries Current playlist cache entry count.",
+    "# TYPE muzik_playlist_cache_entries gauge",
+    `muzik_playlist_cache_entries ${playlistCache.size}`,
+    "",
+  ];
+  response.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
+  response.end(lines.join("\n"));
 }
 
 async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -446,6 +568,10 @@ function authenticateRequest(request: IncomingMessage): void {
 function headerValue(request: IncomingMessage, name: string): string | undefined {
   const value = request.headers[name];
   return typeof value === "string" ? value : undefined;
+}
+
+function safeErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown error";
 }
 
 function loadLocalEnv(): void {

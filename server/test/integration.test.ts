@@ -21,6 +21,14 @@ interface WireMessage {
       connected: boolean;
       isHost: boolean;
       songsAddedCount?: number;
+      chatMuted?: boolean;
+    }>;
+    chat?: Array<{
+      id: string;
+      memberId: string;
+      displayName: string;
+      text: string;
+      sentAt: number;
     }>;
     queue: Array<{
       id: string;
@@ -167,6 +175,19 @@ describe("HTTP and WebSocket integration", () => {
     const hostMembership = await postMembership(`${baseUrl}/api/rooms`, {
       displayName: "Host device",
     });
+    const health = await fetch(`${baseUrl}/health`);
+    const healthBody = await health.json() as {
+      ok: boolean;
+      uptimeSeconds: number;
+      activeRooms: number;
+      webSocketConnections: number;
+    };
+    assert.equal(healthBody.ok, true);
+    assert.ok(healthBody.uptimeSeconds >= 0);
+    assert.ok(healthBody.activeRooms >= 1);
+    assert.equal(healthBody.webSocketConnections, 0);
+    const metrics = await fetch(`${baseUrl}/metrics`);
+    assert.match(await metrics.text(), /muzik_active_rooms [1-9]\d*/);
     const guestMembership = await postMembership(
       `${baseUrl}/api/rooms/${hostMembership.roomCode}/join`,
       { displayName: "Guest device" },
@@ -180,6 +201,15 @@ describe("HTTP and WebSocket integration", () => {
     );
     assert.equal(longSearch.status, 400);
     assert.deepEqual(await longSearch.json(), { error: "Search query is too long" });
+
+    const invalidPlaylist = await fetch(
+      `${baseUrl}/api/youtube/playlist?value=${encodeURIComponent("not a playlist")}`,
+      { headers: membershipHeaders(hostMembership) },
+    );
+    assert.equal(invalidPlaylist.status, 400);
+    assert.deepEqual(await invalidPlaylist.json(), {
+      error: "Enter a valid YouTube playlist URL or ID",
+    });
 
     const host = await connectDevice(baseUrl, hostMembership);
     const guest = await connectDevice(baseUrl, guestMembership);
@@ -220,6 +250,35 @@ describe("HTTP and WebSocket integration", () => {
       );
       assert.equal(attributed.room?.playback.addedByName, "Guest device");
       assert.deepEqual(attributed.room?.history, []);
+
+      guest.send({ type: "chat_send", text: "Hello from integration" });
+      const chatted = await host.waitFor(
+        (message) => message.room?.chat?.some(
+          (chat) => chat.text === "Hello from integration" &&
+            chat.memberId === guestMembership.memberId,
+        ) === true,
+      );
+      const chatId = chatted.room?.chat?.find(
+        (chat) => chat.text === "Hello from integration",
+      )?.id;
+      assert.ok(chatId);
+
+      host.send({ type: "chat_mute", memberId: guestMembership.memberId, muted: true });
+      await guest.waitFor(
+        (message) => message.room?.members.find(
+          (member) => member.id === guestMembership.memberId,
+        )?.chatMuted === true,
+      );
+      guest.send({ type: "chat_send", text: "Muted message" });
+      await guest.waitFor(
+        (message) => message.type === "error" &&
+          message.message === "The host muted your room chat",
+      );
+      const deletedChat = guest.waitForNext(
+        (message) => message.room?.chat?.length === 0,
+      );
+      host.send({ type: "chat_delete", messageId: chatId });
+      await deletedChat;
 
       guest.send(null);
       const invalidMessage = await guest.waitFor(

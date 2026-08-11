@@ -95,6 +95,121 @@ export async function fetchYouTubeSearchResults(
   }
 }
 
+export function parseYouTubePlaylistId(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (/^[A-Za-z0-9_-]{10,100}$/.test(trimmed)) return trimmed;
+  try {
+    const url = new URL(trimmed);
+    if (!/(^|\.)youtube\.com$/i.test(url.hostname)) return undefined;
+    const playlistId = url.searchParams.get("list") ?? "";
+    return /^[A-Za-z0-9_-]{10,100}$/.test(playlistId) ? playlistId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function fetchYouTubePlaylistVideos(
+  value: string,
+  apiKey: string,
+  options: YouTubeSearchOptions = {},
+): Promise<VideoSummary[]> {
+  const playlistId = parseYouTubePlaylistId(value);
+  if (!playlistId) throw new YouTubeSearchError("failed");
+  const fetcher = options.fetcher ?? fetch;
+  const signal = options.signal ?? AbortSignal.timeout(10_000);
+  const playlistUrl = new URL("https://www.googleapis.com/youtube/v3/playlistItems");
+  playlistUrl.search = new URLSearchParams({
+    key: apiKey,
+    part: "contentDetails",
+    playlistId,
+    maxResults: "50",
+  }).toString();
+
+  let playlistResponse: Response;
+  try {
+    playlistResponse = await fetcher(playlistUrl, { signal });
+  } catch (error) {
+    throw new YouTubeSearchError("unavailable", error);
+  }
+  if (!playlistResponse.ok) throw new YouTubeSearchError("failed");
+
+  let playlistBody: unknown;
+  try {
+    playlistBody = await playlistResponse.json();
+  } catch (error) {
+    throw new YouTubeSearchError("failed", error);
+  }
+  const playlistItems = objectValue(playlistBody)?.items;
+  const videoIds = Array.isArray(playlistItems)
+    ? playlistItems.flatMap((value) => {
+        const videoId = objectValue(objectValue(value)?.contentDetails)?.videoId;
+        return typeof videoId === "string" && /^[A-Za-z0-9_-]{11}$/.test(videoId)
+          ? [videoId]
+          : [];
+      })
+    : [];
+  const uniqueVideoIds = [...new Set(videoIds)];
+  if (uniqueVideoIds.length === 0) return [];
+
+  const videosUrl = new URL("https://www.googleapis.com/youtube/v3/videos");
+  videosUrl.search = new URLSearchParams({
+    key: apiKey,
+    part: "snippet,contentDetails,status",
+    id: uniqueVideoIds.join(","),
+  }).toString();
+  let videosResponse: Response;
+  try {
+    videosResponse = await fetcher(videosUrl, { signal });
+  } catch (error) {
+    throw new YouTubeSearchError("unavailable", error);
+  }
+  if (!videosResponse.ok) throw new YouTubeSearchError("failed");
+
+  let videosBody: unknown;
+  try {
+    videosBody = await videosResponse.json();
+  } catch (error) {
+    throw new YouTubeSearchError("failed", error);
+  }
+  const videoItems = objectValue(videosBody)?.items;
+  const byId = new Map<string, VideoSummary>();
+  if (Array.isArray(videoItems)) {
+    for (const value of videoItems) {
+      const item = objectValue(value);
+      const snippet = objectValue(item?.snippet);
+      const status = objectValue(item?.status);
+      const contentDetails = objectValue(item?.contentDetails);
+      if (
+        typeof item?.id !== "string" ||
+        typeof snippet?.title !== "string" ||
+        status?.embeddable !== true
+      ) {
+        continue;
+      }
+      const thumbnails = objectValue(snippet.thumbnails);
+      const medium = objectValue(thumbnails?.medium);
+      const fallback = objectValue(thumbnails?.default);
+      const result: VideoSummary = {
+        videoId: item.id,
+        title: decodeEntities(snippet.title),
+        channelTitle: decodeEntities(
+          typeof snippet.channelTitle === "string" ? snippet.channelTitle : "",
+        ),
+        thumbnailUrl: typeof medium?.url === "string"
+          ? medium.url
+          : typeof fallback?.url === "string" ? fallback.url : "",
+      };
+      const durationMs = parseIso8601DurationMs(contentDetails?.duration);
+      if (durationMs !== undefined) result.durationMs = durationMs;
+      byId.set(item.id, result);
+    }
+  }
+  return uniqueVideoIds.flatMap((videoId) => {
+    const result = byId.get(videoId);
+    return result ? [result] : [];
+  });
+}
+
 export function parseIso8601DurationMs(value: unknown): number | undefined {
   if (typeof value !== "string") return undefined;
   const match = /^P(?:(\d+(?:[.,]\d+)?)D)?(?:T(?:(\d+(?:[.,]\d+)?)H)?(?:(\d+(?:[.,]\d+)?)M)?(?:(\d+(?:[.,]\d+)?)S)?)?$/i.exec(value);

@@ -1,4 +1,5 @@
 import java.util.Properties
+import org.gradle.api.GradleException
 
 plugins {
     id("com.android.application")
@@ -13,6 +14,29 @@ val localProperties = Properties().apply {
 }
 val muzikServerUrl = providers.gradleProperty("MUZIK_SERVER_URL")
     .orElse(localProperties.getProperty("MUZIK_SERVER_URL") ?: "http://10.0.2.2:8080")
+
+fun releaseSigningValue(name: String): String? = providers.gradleProperty(name)
+    .orElse(providers.environmentVariable(name))
+    .orNull
+    ?.trim()
+    ?.takeIf(String::isNotEmpty)
+
+val releaseStoreFile = releaseSigningValue("MUZIK_RELEASE_STORE_FILE")
+val releaseStorePassword = releaseSigningValue("MUZIK_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = releaseSigningValue("MUZIK_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = releaseSigningValue("MUZIK_RELEASE_KEY_PASSWORD")
+val releaseSigningValues = listOf(
+    releaseStoreFile,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+)
+
+if (releaseSigningValues.any { it != null } && releaseSigningValues.any { it == null }) {
+    throw GradleException(
+        "Release signing is only partially configured. Set all four MUZIK_RELEASE_* values.",
+    )
+}
 
 android {
     namespace = "com.muzik.app"
@@ -29,12 +53,24 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (releaseSigningValues.all { it != null }) {
+            create("release") {
+                storeFile = rootProject.file(checkNotNull(releaseStoreFile))
+                storePassword = checkNotNull(releaseStorePassword)
+                keyAlias = checkNotNull(releaseKeyAlias)
+                keyPassword = checkNotNull(releaseKeyPassword)
+            }
+        }
+    }
+
     buildTypes {
         debug {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
         }
         release {
             isMinifyEnabled = true
+            signingConfig = signingConfigs.findByName("release")
             manifestPlaceholders["usesCleartextTraffic"] = "false"
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

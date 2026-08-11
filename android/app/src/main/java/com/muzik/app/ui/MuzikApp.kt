@@ -32,6 +32,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
@@ -110,6 +113,7 @@ import com.muzik.app.MuzikUiState
 import com.muzik.app.MuzikViewModel
 import com.muzik.app.RoomRequest
 import com.muzik.app.model.ConnectionStatus
+import com.muzik.app.model.ChatMessage
 import com.muzik.app.model.MemberSummary
 import com.muzik.app.model.QueueItem
 import com.muzik.app.model.RoomSnapshot
@@ -531,6 +535,8 @@ private fun RoomContent(
     isInPictureInPictureMode: Boolean,
 ) {
     var showMembers by rememberSaveable(room.code) { mutableStateOf(false) }
+    var showClearQueueConfirmation by rememberSaveable(room.code) { mutableStateOf(false) }
+    var chatDraft by rememberSaveable(room.code) { mutableStateOf("") }
     val listState = rememberLazyListState()
     val dragScrollScope = rememberCoroutineScope()
     val dragEdgeSizePx = with(LocalDensity.current) { 72.dp.toPx() }
@@ -618,6 +624,20 @@ private fun RoomContent(
                         },
                     )
                 }
+                if (room.me.isHost && room.queue.isNotEmpty()) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                            horizontalArrangement = Arrangement.End,
+                        ) {
+                            TextButton(onClick = { showClearQueueConfirmation = true }) {
+                                Icon(Icons.Default.Delete, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Clear queue")
+                            }
+                        }
+                    }
+                }
                 if (room.queue.isNotEmpty()) {
                     item { QueueOrderingHint(room) }
                 }
@@ -703,6 +723,39 @@ private fun RoomContent(
                         )
                     }
                 }
+                item {
+                    SectionHeader(
+                        title = "Room chat",
+                        detail = if (room.chat.isEmpty()) {
+                            "No messages"
+                        } else {
+                            "${room.chat.size} messages"
+                        },
+                    )
+                }
+                items(room.chat, key = ChatMessage::id) { message ->
+                    ChatRow(
+                        message = message,
+                        serverTimeMs = room.serverTimeMs,
+                        canDelete = room.me.isHost,
+                        onDelete = { viewModel.deleteChat(message.id) },
+                    )
+                }
+                item {
+                    val muted = room.members.firstOrNull { it.id == room.me.id }?.chatMuted == true
+                    ChatComposer(
+                        value = chatDraft,
+                        muted = muted,
+                        onValueChange = { chatDraft = it.take(500) },
+                        onSend = {
+                            val message = chatDraft.trim()
+                            if (message.isNotEmpty()) {
+                                viewModel.sendChat(message)
+                                chatDraft = ""
+                            }
+                        },
+                    )
+                }
                 val historyCount = room.history.size + if (room.playback.video != null) 1 else 0
                 item {
                     SectionHeader(
@@ -761,8 +814,140 @@ private fun RoomContent(
         MemberListDialog(
             members = room.members,
             currentAddedBy = room.playback.addedBy,
+            currentMemberId = room.me.id,
+            isHost = room.me.isHost,
+            onSetChatMuted = viewModel::setChatMuted,
             onDismiss = { showMembers = false },
         )
+    }
+    if (showClearQueueConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showClearQueueConfirmation = false },
+            title = { Text("Clear the queue?", fontWeight = FontWeight.Bold) },
+            text = {
+                Text("This removes all ${room.queue.size} queued videos. The current video keeps playing.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearQueueConfirmation = false
+                        viewModel.clearQueue()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) {
+                    Text("Clear queue")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearQueueConfirmation = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun ChatRow(
+    message: ChatMessage,
+    serverTimeMs: Long,
+    canDelete: Boolean,
+    onDelete: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.34f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.14f)),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 12.dp, top = 10.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+            ) {
+                Box(Modifier.size(36.dp), contentAlignment = Alignment.Center) {
+                    Text(
+                        message.displayName.firstOrNull()?.uppercase() ?: "?",
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                }
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    "${message.displayName}  •  ${formatRelativeTime(serverTimeMs - message.sentAt)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    message.text,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+            if (canDelete) {
+                IconButton(onClick = onDelete, modifier = Modifier.size(48.dp)) {
+                    Icon(
+                        Icons.Default.Delete,
+                        contentDescription = "Delete message from ${message.displayName}",
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                }
+            } else {
+                Spacer(Modifier.width(12.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChatComposer(
+    value: String,
+    muted: Boolean,
+    onValueChange: (String) -> Unit,
+    onSend: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f),
+    ) {
+        if (muted) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(Icons.AutoMirrored.Filled.VolumeOff, contentDescription = null)
+                Spacer(Modifier.width(10.dp))
+                Text("The host muted your room chat.")
+            }
+        } else {
+            OutlinedTextField(
+                value = value,
+                onValueChange = onValueChange,
+                label = { Text("Message the room") },
+                supportingText = { Text("${value.length}/500") },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                trailingIcon = {
+                    IconButton(onClick = onSend, enabled = value.isNotBlank()) {
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send message")
+                    }
+                },
+                minLines = 1,
+                maxLines = 4,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
     }
 }
 
@@ -865,6 +1050,9 @@ private fun ConnectionNotice(status: ConnectionStatus) {
 private fun MemberListDialog(
     members: List<MemberSummary>,
     currentAddedBy: String?,
+    currentMemberId: String,
+    isHost: Boolean,
+    onSetChatMuted: (String, Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val sortedMembers = remember(members, currentAddedBy) {
@@ -896,6 +1084,10 @@ private fun MemberListDialog(
                     MemberRow(
                         member = member,
                         addedCurrentSong = member.id == currentAddedBy,
+                        canModerate = isHost && member.id != currentMemberId,
+                        onToggleChatMuted = {
+                            onSetChatMuted(member.id, !member.chatMuted)
+                        },
                     )
                 }
             }
@@ -908,7 +1100,12 @@ private fun MemberListDialog(
 }
 
 @Composable
-private fun MemberRow(member: MemberSummary, addedCurrentSong: Boolean) {
+private fun MemberRow(
+    member: MemberSummary,
+    addedCurrentSong: Boolean,
+    canModerate: Boolean,
+    onToggleChatMuted: () -> Unit,
+) {
     Surface(
         shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f),
@@ -963,6 +1160,27 @@ private fun MemberRow(member: MemberSummary, addedCurrentSong: Boolean) {
                         color = MaterialTheme.colorScheme.secondary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            if (canModerate) {
+                IconButton(onClick = onToggleChatMuted) {
+                    Icon(
+                        if (member.chatMuted) {
+                            Icons.AutoMirrored.Filled.VolumeUp
+                        } else {
+                            Icons.AutoMirrored.Filled.VolumeOff
+                        },
+                        contentDescription = if (member.chatMuted) {
+                            "Unmute ${member.displayName} in chat"
+                        } else {
+                            "Mute ${member.displayName} in chat"
+                        },
+                        tint = if (member.chatMuted) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                     )
                 }
             }
@@ -1780,6 +1998,53 @@ private fun SearchBox(state: MuzikUiState, viewModel: MuzikViewModel) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 16.dp),
+                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
+            )
+            Text(
+                "Import a YouTube playlist",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                "Adds up to 50 new embeddable videos while preserving playlist order.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = state.playlistInput,
+                onValueChange = viewModel::setPlaylistInput,
+                placeholder = { Text("Playlist URL or ID") },
+                leadingIcon = {
+                    Icon(Icons.AutoMirrored.Filled.PlaylistPlay, contentDescription = null)
+                },
+                trailingIcon = {
+                    if (state.importingPlaylist) {
+                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    } else {
+                        IconButton(
+                            onClick = viewModel::importPlaylist,
+                            enabled = state.playlistInput.isNotBlank(),
+                        ) {
+                            Icon(
+                                Icons.Default.Add,
+                                contentDescription = "Import YouTube playlist",
+                            )
+                        }
+                    }
+                },
+                enabled = !state.importingPlaylist,
+                singleLine = true,
+                shape = RoundedCornerShape(16.dp),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = {
+                    viewModel.importPlaylist()
+                    focusManager.clearFocus()
+                }),
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
     }
 }

@@ -30,6 +30,16 @@ data class MemberSummary(
     val isHost: Boolean,
     val connected: Boolean,
     val songsAddedCount: Int = 0,
+    val chatMuted: Boolean = false,
+)
+
+@Serializable
+data class ChatMessage(
+    val id: String,
+    val memberId: String,
+    val displayName: String,
+    val text: String,
+    val sentAt: Long,
 )
 
 @Serializable
@@ -110,6 +120,7 @@ data class RoomSnapshot(
     val playback: PlaybackState,
     val skip: SkipState,
     val history: List<HistoryItem> = emptyList(),
+    val chat: List<ChatMessage> = emptyList(),
     val pauseVote: PauseVoteState? = null,
 )
 

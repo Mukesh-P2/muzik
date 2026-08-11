@@ -121,16 +121,7 @@ class RoomConnection(
     }
 
     fun addToQueue(video: VideoSummary, startPlayback: Boolean = false) {
-        val addMessage = buildJsonObject {
-            put("type", "queue_add")
-            putJsonObject("video") {
-                put("videoId", video.videoId)
-                put("title", video.title)
-                put("channelTitle", video.channelTitle)
-                put("thumbnailUrl", video.thumbnailUrl)
-                video.durationMs?.let { put("durationMs", it) }
-            }
-        }
+        val addMessage = queueAddMessage(video)
         if (startPlayback) {
             sendInOrder(
                 addMessage,
@@ -144,6 +135,18 @@ class RoomConnection(
         }
     }
 
+    fun addManyToQueue(videos: List<VideoSummary>, startPlayback: Boolean = false) {
+        if (videos.isEmpty()) return
+        val messages = videos.map(::queueAddMessage).toMutableList()
+        if (startPlayback) {
+            messages += buildJsonObject {
+                put("type", "playback_control")
+                put("action", "play")
+            }
+        }
+        sendInOrder(*messages.toTypedArray())
+    }
+
     fun vote(itemId: String, enabled: Boolean) = send(buildJsonObject {
         put("type", "queue_vote")
         put("itemId", itemId)
@@ -154,6 +157,8 @@ class RoomConnection(
         put("type", "queue_remove")
         put("itemId", itemId)
     })
+
+    fun clearQueue() = send(buildJsonObject { put("type", "queue_clear") })
 
     fun reorder(itemId: String, beforeItemId: String?) =
         send(queueReorderMessage(itemId, beforeItemId))
@@ -176,6 +181,13 @@ class RoomConnection(
     fun votePause(vote: Boolean, pollId: String) = send(pauseVoteMessage(vote, pollId))
 
     fun voteToSkip() = send(buildJsonObject { put("type", "skip_vote") })
+
+    fun sendChat(text: String) = send(chatSendMessage(text))
+
+    fun deleteChat(messageId: String) = send(chatDeleteMessage(messageId))
+
+    fun setChatMuted(memberId: String, muted: Boolean) =
+        send(chatMuteMessage(memberId, muted))
 
     private fun send(payload: JsonObject) {
         sendInOrder(payload)
@@ -239,6 +251,17 @@ internal fun queueReorderMessage(itemId: String, beforeItemId: String?): JsonObj
         beforeItemId?.let { put("beforeItemId", it) }
     }
 
+internal fun queueAddMessage(video: VideoSummary): JsonObject = buildJsonObject {
+    put("type", "queue_add")
+    putJsonObject("video") {
+        put("videoId", video.videoId)
+        put("title", video.title)
+        put("channelTitle", video.channelTitle)
+        put("thumbnailUrl", video.thumbnailUrl)
+        video.durationMs?.let { put("durationMs", it) }
+    }
+}
+
 internal fun queuePlayNextMessage(itemId: String): JsonObject = buildJsonObject {
     put("type", "queue_play_next")
     put("itemId", itemId)
@@ -252,4 +275,20 @@ internal fun pauseVoteMessage(vote: Boolean, pollId: String): JsonObject = build
     put("type", "pause_vote")
     put("vote", if (vote) "yes" else "no")
     put("pollId", pollId)
+}
+
+internal fun chatSendMessage(text: String): JsonObject = buildJsonObject {
+    put("type", "chat_send")
+    put("text", text)
+}
+
+internal fun chatDeleteMessage(messageId: String): JsonObject = buildJsonObject {
+    put("type", "chat_delete")
+    put("messageId", messageId)
+}
+
+internal fun chatMuteMessage(memberId: String, muted: Boolean): JsonObject = buildJsonObject {
+    put("type", "chat_mute")
+    put("memberId", memberId)
+    put("muted", muted)
 }
