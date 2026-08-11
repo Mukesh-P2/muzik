@@ -4,6 +4,7 @@ import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import { RoomError, RoomManager } from "./room.js";
 import type { VideoSummary } from "./types.js";
+import { fetchYouTubeSearchResults, YouTubeSearchError } from "./youtube.js";
 
 loadLocalEnv();
 
@@ -12,6 +13,7 @@ const allowedOrigin = process.env.ALLOWED_ORIGIN ?? "*";
 const rooms = new RoomManager();
 const sockets = new Map<string, Map<string, Set<WebSocket>>>();
 const responsiveSockets = new WeakSet<WebSocket>();
+const pauseVoteCapableSockets = new WeakSet<WebSocket>();
 const searchCache = new Map<string, { expiresAt: number; results: VideoSummary[] }>();
 const rateLimits = new Map<string, { resetAt: number; count: number }>();
 const ROOM_IDLE_TTL_MS = 6 * 60 * 60 * 1_000;
@@ -83,11 +85,19 @@ server.on("upgrade", (request, socket, head) => {
     const roomCode = headerValue(request, "x-room-code") ?? url.searchParams.get("roomCode") ?? "";
     const memberId = headerValue(request, "x-member-id") ?? url.searchParams.get("memberId") ?? "";
     const token = headerValue(request, "x-member-token") ?? url.searchParams.get("token") ?? "";
+    const pauseVoteCapable = (headerValue(request, "x-muzik-capabilities") ?? "")
+      .split(",")
+      .map((capability) => capability.trim().toLowerCase())
+      .includes("pause-vote-v1");
     const room = rooms.getRoom(roomCode);
     room.authenticate(memberId, token);
 
     webSockets.handleUpgrade(request, socket, head, (webSocket) => {
-      webSockets.emit("connection", webSocket, request, { roomCode: room.code, memberId });
+      webSockets.emit("connection", webSocket, request, {
+        roomCode: room.code,
+        memberId,
+        pauseVoteCapable,
+      });
     });
   } catch {
     socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
@@ -98,12 +108,21 @@ server.on("upgrade", (request, socket, head) => {
 webSockets.on(
   "connection",
   (webSocket: WebSocket, _request: IncomingMessage, context: unknown) => {
-    const { roomCode, memberId } = context as { roomCode: string; memberId: string };
+    const { roomCode, memberId, pauseVoteCapable } = context as {
+      roomCode: string;
+      memberId: string;
+      pauseVoteCapable: boolean;
+    };
     const room = rooms.getRoom(roomCode);
+    if (pauseVoteCapable) pauseVoteCapableSockets.add(webSocket);
     addSocket(roomCode, memberId, webSocket);
     responsiveSockets.add(webSocket);
     webSocket.on("pong", () => responsiveSockets.add(webSocket));
     room.setConnected(memberId, true);
+    room.setPauseVoteCapable(
+      memberId,
+      hasPauseVoteCapableSocket(roomCode, memberId),
+    );
     broadcastRoom(roomCode);
     let messageWindowStartedAt = Date.now();
     let messageCount = 0;
@@ -137,6 +156,15 @@ webSockets.on(
           room.setVote(memberId, String(message.itemId ?? ""), Boolean(message.enabled));
         } else if (message.type === "queue_remove") {
           room.removeQueueItem(memberId, String(message.itemId ?? ""));
+        } else if (message.type === "queue_reorder") {
+          const beforeItemId = optionalNullableString(message.beforeItemId);
+          room.reorderQueueItem(
+            memberId,
+            String(message.itemId ?? ""),
+            beforeItemId,
+          );
+        } else if (message.type === "queue_play_next") {
+          room.forcePlayNext(memberId, String(message.itemId ?? ""));
         } else if (message.type === "play_item") {
           room.playQueueItem(memberId, String(message.itemId ?? ""));
         } else if (message.type === "playback_control") {
@@ -145,6 +173,14 @@ webSockets.on(
             throw new RoomError("Unknown playback action");
           }
           room.control(memberId, action, numberOrUndefined(message.positionMs));
+        } else if (message.type === "pause_request") {
+          room.requestPause(memberId);
+        } else if (message.type === "pause_vote") {
+          const vote = String(message.vote ?? "");
+          if (vote !== "yes" && vote !== "no") {
+            throw new RoomError("Pause vote must be yes or no");
+          }
+          room.castPauseVote(memberId, vote, String(message.pollId ?? ""));
         } else if (message.type === "skip_vote") {
           room.voteToSkip(memberId);
         } else if (message.type === "leave_room") {
@@ -174,6 +210,11 @@ webSockets.on(
       removeSocket(roomCode, memberId, webSocket);
       if (room.hasMember(memberId) && !hasSocket(roomCode, memberId)) {
         room.setConnected(memberId, false);
+      } else if (room.hasMember(memberId)) {
+        room.setPauseVoteCapable(
+          memberId,
+          hasPauseVoteCapableSocket(roomCode, memberId),
+        );
       }
       broadcastRoom(roomCode);
     });
@@ -210,6 +251,11 @@ const cleanupTimer = setInterval(() => {
 }, 10 * 60_000);
 cleanupTimer.unref();
 
+const pauseVoteTimer = setInterval(() => {
+  for (const roomCode of rooms.expirePauseVotes()) broadcastRoom(roomCode);
+}, 100);
+pauseVoteTimer.unref();
+
 server.listen(port, "0.0.0.0", () => {
   console.log(`Muzik server listening on http://0.0.0.0:${port}`);
 });
@@ -218,6 +264,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
     clearInterval(heartbeatTimer);
     clearInterval(cleanupTimer);
+    clearInterval(pauseVoteTimer);
     webSockets.close();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(1), 10_000).unref();
@@ -241,46 +288,24 @@ async function searchYouTube(query: string): Promise<VideoSummary[]> {
 
   const apiKey = process.env.YOUTUBE_API_KEY;
   if (!apiKey) throw new RoomError("YouTube search is not configured", 503);
-  const url = new URL("https://www.googleapis.com/youtube/v3/search");
-  url.search = new URLSearchParams({
-    key: apiKey,
-    part: "snippet",
-    type: "video",
-    videoEmbeddable: "true",
-    maxResults: "15",
-    q: query,
-  }).toString();
-  let response: Response;
+  let results: VideoSummary[];
   try {
-    response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    results = await fetchYouTubeSearchResults(query, apiKey, {
+      signal: AbortSignal.timeout(10_000),
+      onDurationError: () => console.warn("YouTube duration enrichment failed"),
+    });
   } catch (error) {
-    console.warn("YouTube search request failed:", error);
-    throw new RoomError("YouTube search is temporarily unavailable", 502);
+    if (error instanceof YouTubeSearchError && error.kind === "unavailable") {
+      console.warn("YouTube search request failed");
+      throw new RoomError("YouTube search is temporarily unavailable", 502);
+    }
+    throw new RoomError("YouTube search failed", 502);
   }
-  if (!response.ok) throw new RoomError("YouTube search failed", 502);
-  const body = (await response.json()) as {
-    items?: Array<{
-      id?: { videoId?: string };
-      snippet?: {
-        title?: string;
-        channelTitle?: string;
-        thumbnails?: { medium?: { url?: string }; default?: { url?: string } };
-      };
-    }>;
-  };
-  const results = (body.items ?? []).flatMap((item) => {
-    const videoId = item.id?.videoId;
-    const snippet = item.snippet;
-    if (!videoId || !snippet?.title) return [];
-    return [{
-      videoId,
-      title: decodeEntities(snippet.title),
-      channelTitle: decodeEntities(snippet.channelTitle ?? ""),
-      thumbnailUrl: snippet.thumbnails?.medium?.url ?? snippet.thumbnails?.default?.url ?? "",
-    }];
-  });
   if (searchCache.size >= 200) searchCache.delete(searchCache.keys().next().value ?? "");
-  searchCache.set(cacheKey, { expiresAt: Date.now() + 10 * 60_000, results });
+  const cacheTtlMs = results.every((result) => result.durationMs !== undefined)
+    ? 10 * 60_000
+    : 30_000;
+  searchCache.set(cacheKey, { expiresAt: Date.now() + cacheTtlMs, results });
   return results;
 }
 
@@ -310,6 +335,11 @@ function hasSocket(roomCode: string, memberId: string): boolean {
   return (sockets.get(roomCode)?.get(memberId)?.size ?? 0) > 0;
 }
 
+function hasPauseVoteCapableSocket(roomCode: string, memberId: string): boolean {
+  return [...(sockets.get(roomCode)?.get(memberId) ?? [])]
+    .some((socket) => pauseVoteCapableSockets.has(socket));
+}
+
 function closeMemberSockets(roomCode: string, memberId: string): void {
   const roomSockets = sockets.get(roomCode);
   const memberSockets = roomSockets?.get(memberId);
@@ -328,7 +358,7 @@ function setCors(response: ServerResponse): void {
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader(
     "Access-Control-Allow-Headers",
-    "content-type, authorization, x-room-code, x-member-id, x-member-token",
+    "content-type, authorization, x-room-code, x-member-id, x-member-token, x-muzik-capabilities",
   );
   response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 }
@@ -390,6 +420,11 @@ function numberOrUndefined(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
+function optionalNullableString(value: unknown): string | null | undefined {
+  if (value === undefined || value === null || typeof value === "string") return value;
+  throw new RoomError("beforeItemId must be a string or null");
+}
+
 function parsePort(value: string | undefined): number {
   const parsed = Number(value ?? 8080);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) {
@@ -428,13 +463,4 @@ function loadLocalEnv(): void {
     }
     if (process.env[key] === undefined) process.env[key] = value;
   }
-}
-
-function decodeEntities(value: string): string {
-  return value
-    .replaceAll("&amp;", "&")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&#39;", "'")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">");
 }

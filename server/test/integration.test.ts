@@ -16,9 +16,46 @@ interface WireMessage {
   message?: string;
   room?: {
     me: { id: string; isHost: boolean };
-    members: Array<{ id: string; connected: boolean; isHost: boolean }>;
-    queue: Array<{ id: string; voteCount: number }>;
-    playback: { status: string; video: { videoId: string } | null };
+    members: Array<{
+      id: string;
+      connected: boolean;
+      isHost: boolean;
+      songsAddedCount?: number;
+    }>;
+    queue: Array<{
+      id: string;
+      video: { videoId: string; title: string };
+      addedBy: string;
+      addedByName?: string;
+      voteCount: number;
+      isForcedNext?: boolean;
+    }>;
+    playback: {
+      status: string;
+      video: { videoId: string; title: string } | null;
+      revision: number;
+      addedBy?: string;
+      addedByName?: string;
+    };
+    history?: Array<{
+      id: string;
+      video: { videoId: string; title: string };
+      addedBy: string;
+      addedByName?: string;
+      playedAt: number;
+    }>;
+    pauseVote?: {
+      id: string;
+      requestedBy: string;
+      requestedByName: string;
+      yesVotes: number;
+      noVotes: number;
+      threshold: number;
+      eligibleVoters: number;
+      myVote?: "yes" | "no";
+      startedAt: number;
+      expiresAt: number;
+    };
   };
 }
 
@@ -48,6 +85,30 @@ class TestDevice {
       }, 5_000);
       const check = () => {
         const message = [...this.history].reverse().find(predicate);
+        if (!message) return;
+        clearTimeout(timeout);
+        this.listeners.delete(check);
+        resolve(message);
+      };
+      this.listeners.add(check);
+    });
+  }
+
+  async waitForNext(
+    predicate: (message: WireMessage) => boolean,
+    timeoutMs = 5_000,
+  ): Promise<WireMessage> {
+    const firstUnseenIndex = this.history.length;
+    return await new Promise<WireMessage>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.listeners.delete(check);
+        reject(new Error(`Timed out waiting for next device message; received ${JSON.stringify(this.history.slice(firstUnseenIndex))}`));
+      }, timeoutMs);
+      const check = () => {
+        const message = this.history
+          .slice(firstUnseenIndex)
+          .reverse()
+          .find(predicate);
         if (!message) return;
         clearTimeout(timeout);
         this.listeners.delete(check);
@@ -138,6 +199,13 @@ describe("HTTP and WebSocket integration", () => {
       const queued = await host.waitFor((message) => message.room?.queue.length === 1);
       const itemId = queued.room?.queue[0]?.id;
       assert.ok(itemId);
+      assert.equal(queued.room?.queue[0]?.addedBy, guestMembership.memberId);
+      assert.equal(queued.room?.queue[0]?.addedByName, "Guest device");
+      assert.equal(
+        queued.room?.members.find((member) => member.id === guestMembership.memberId)
+          ?.songsAddedCount,
+        1,
+      );
 
       host.send({ type: "queue_vote", itemId, enabled: true });
       await guest.waitFor((message) => message.room?.queue[0]?.voteCount === 2);
@@ -147,6 +215,11 @@ describe("HTTP and WebSocket integration", () => {
         (message) => message.room?.playback.video?.videoId === "dQw4w9WgXcQ" &&
           message.room.playback.status === "playing",
       );
+      const attributed = await host.waitFor(
+        (message) => message.room?.playback.addedBy === guestMembership.memberId,
+      );
+      assert.equal(attributed.room?.playback.addedByName, "Guest device");
+      assert.deepEqual(attributed.room?.history, []);
 
       guest.send(null);
       const invalidMessage = await guest.waitFor(
@@ -177,7 +250,387 @@ describe("HTTP and WebSocket integration", () => {
       await guest.close();
     }
   });
+
+  it("broadcasts reorder, forced-next, history, and pause votes across clients", async () => {
+    const hostMembership = await postMembership(`${baseUrl}/api/rooms`, {
+      displayName: "Host",
+    });
+    const firstMembership = await postMembership(
+      `${baseUrl}/api/rooms/${hostMembership.roomCode}/join`,
+      { displayName: "First guest" },
+    );
+    const secondMembership = await postMembership(
+      `${baseUrl}/api/rooms/${hostMembership.roomCode}/join`,
+      { displayName: "Second guest" },
+    );
+    const host = await connectDevice(baseUrl, hostMembership);
+    const first = await connectDevice(baseUrl, firstMembership);
+    const second = await connectDevice(baseUrl, secondMembership);
+
+    try {
+      await second.waitFor((message) => connectedCount(message) === 3);
+      host.send({
+        type: "queue_add",
+        video: integrationVideo("aaaaaaaaaaa", "Current"),
+      });
+      const currentSnapshot = await first.waitFor(
+        (message) => message.room?.queue.some((item) => item.video.title === "Current") === true,
+      );
+      const currentId = currentSnapshot.room?.queue.find(
+        (item) => item.video.title === "Current",
+      )?.id;
+      assert.ok(currentId);
+      host.send({ type: "play_item", itemId: currentId });
+      await second.waitFor(
+        (message) => message.room?.playback.video?.title === "Current" &&
+          message.room.playback.status === "playing",
+      );
+
+      first.send({
+        type: "queue_add",
+        video: integrationVideo("bbbbbbbbbbb", "First tied"),
+      });
+      await second.waitFor((message) => message.room?.queue.length === 1);
+      second.send({
+        type: "queue_add",
+        video: integrationVideo("ccccccccccc", "Second tied"),
+      });
+      await host.waitFor((message) => message.room?.queue.length === 2);
+      first.send({
+        type: "queue_add",
+        video: integrationVideo("ddddddddddd", "Popular"),
+      });
+      const threeQueued = await second.waitFor((message) => message.room?.queue.length === 3);
+      const firstTiedId = threeQueued.room?.queue.find(
+        (item) => item.video.title === "First tied",
+      )?.id;
+      const secondTiedId = threeQueued.room?.queue.find(
+        (item) => item.video.title === "Second tied",
+      )?.id;
+      const popularId = threeQueued.room?.queue.find(
+        (item) => item.video.title === "Popular",
+      )?.id;
+      assert.ok(firstTiedId && secondTiedId && popularId);
+
+      second.send({ type: "queue_vote", itemId: popularId, enabled: true });
+      await host.waitFor(
+        (message) => message.room?.queue.find((item) => item.id === popularId)?.voteCount === 2,
+      );
+      first.send({
+        type: "queue_reorder",
+        itemId: secondTiedId,
+        beforeItemId: firstTiedId,
+      });
+      await first.waitFor(
+        (message) => message.type === "error" && message.message === "Host permission required",
+      );
+
+      host.send({
+        type: "queue_reorder",
+        itemId: secondTiedId,
+        beforeItemId: firstTiedId,
+      });
+      const reordered = await second.waitFor(
+        (message) => message.room?.queue.map((item) => item.video.title).join(",") ===
+          "Popular,Second tied,First tied",
+      );
+      assert.deepEqual(
+        reordered.room?.queue.map((item) => item.id),
+        [popularId, secondTiedId, firstTiedId],
+      );
+      host.send({
+        type: "queue_reorder",
+        itemId: secondTiedId,
+        beforeItemId: popularId,
+      });
+      await host.waitFor(
+        (message) => message.type === "error" &&
+          message.message === "Only queue items with equal votes can be reordered",
+      );
+
+      host.send({ type: "queue_play_next", itemId: firstTiedId });
+      const markedForHost = await host.waitFor(
+        (message) => message.room?.queue.find((item) => item.id === firstTiedId)
+          ?.isForcedNext === true,
+      );
+      const markedForGuest = await first.waitFor(
+        (message) => message.room?.queue.find((item) => item.id === firstTiedId)
+          ?.isForcedNext === true,
+      );
+      assert.equal(markedForHost.room?.playback.video?.title, "Current");
+      assert.equal(markedForGuest.room?.playback.video?.title, "Current");
+
+      host.send({ type: "playback_control", action: "next" });
+      const forcedPlayed = await second.waitFor(
+        (message) => message.room?.playback.video?.title === "First tied",
+      );
+      assert.equal(forcedPlayed.room?.playback.addedBy, firstMembership.memberId);
+      assert.equal(forcedPlayed.room?.playback.addedByName, "First guest");
+      assert.deepEqual(
+        forcedPlayed.room?.history?.map((item) => item.video.title),
+        ["Current"],
+      );
+      assert.equal(
+        forcedPlayed.room?.queue.some((item) => item.isForcedNext),
+        false,
+      );
+
+      first.send({ type: "pause_request" });
+      const requested = await host.waitFor(
+        (message) => message.room?.pauseVote?.requestedBy === firstMembership.memberId,
+      );
+      assert.equal(requested.room?.pauseVote?.yesVotes, 0);
+      assert.equal(requested.room?.pauseVote?.threshold, 2);
+      assert.equal(requested.room?.pauseVote?.eligibleVoters, 3);
+      const pollId = requested.room?.pauseVote?.id;
+      assert.ok(pollId);
+      first.send({ type: "pause_vote", vote: "no", pollId });
+      await second.waitFor((message) => message.room?.pauseVote?.noVotes === 1);
+      second.send({ type: "pause_vote", vote: "yes", pollId });
+      await host.waitFor((message) => message.room?.pauseVote?.yesVotes === 1);
+      first.send({ type: "pause_vote", vote: "yes", pollId });
+      const votePaused = await second.waitFor(
+        (message) => message.room?.playback.status === "paused" &&
+          message.room.pauseVote === undefined,
+      );
+      assert.equal(votePaused.room?.playback.video?.title, "First tied");
+
+      host.send({ type: "playback_control", action: "play" });
+      const resumed = await first.waitFor(
+        (message) => message.room?.playback.status === "playing" &&
+          message.room.playback.video?.title === "First tied",
+      );
+      const resumedRevision = resumed.room?.playback.revision ?? 0;
+      host.send({ type: "playback_control", action: "pause" });
+      await first.waitFor(
+        (message) => message.room?.playback.status === "paused" &&
+          message.room.playback.revision > resumedRevision,
+      );
+    } finally {
+      await host.close();
+      await first.close();
+      await second.close();
+    }
+  });
+
+  it("excludes connected legacy clients from pause-vote thresholds", async () => {
+    const hostMembership = await postMembership(`${baseUrl}/api/rooms`, {
+      displayName: "Host",
+    });
+    const requesterMembership = await postMembership(
+      `${baseUrl}/api/rooms/${hostMembership.roomCode}/join`,
+      { displayName: "Requester" },
+    );
+    const legacyMembership = await postMembership(
+      `${baseUrl}/api/rooms/${hostMembership.roomCode}/join`,
+      { displayName: "Legacy client" },
+    );
+    const host = await connectDevice(baseUrl, hostMembership);
+    const requester = await connectDevice(baseUrl, requesterMembership);
+    const legacy = await connectDevice(baseUrl, legacyMembership, false);
+
+    try {
+      await requester.waitFor((message) => connectedCount(message) === 3);
+      host.send({
+        type: "queue_add",
+        video: integrationVideo("ggggggggggg", "Mixed-version current"),
+      });
+      const queued = await requester.waitFor((message) => message.room?.queue.length === 1);
+      const itemId = queued.room?.queue[0]?.id;
+      assert.ok(itemId);
+      host.send({ type: "play_item", itemId });
+      await requester.waitFor(
+        (message) => message.room?.playback.status === "playing",
+      );
+
+      requester.send({ type: "pause_request" });
+      const requested = await requester.waitFor(
+        (message) => message.room?.pauseVote?.requestedBy === requesterMembership.memberId,
+      );
+      assert.equal(requested.room?.pauseVote?.eligibleVoters, 2);
+      assert.equal(requested.room?.pauseVote?.threshold, 1);
+      const pollId = requested.room?.pauseVote?.id;
+      assert.ok(pollId);
+      requester.send({ type: "pause_vote", vote: "yes", pollId });
+      await legacy.waitFor(
+        (message) => message.room?.playback.status === "paused" &&
+          message.room.pauseVote === undefined,
+      );
+    } finally {
+      await host.close();
+      await requester.close();
+      await legacy.close();
+    }
+  });
+
+  it("broadcasts each pause-poll completion path", async () => {
+    const autoHostMembership = await postMembership(`${baseUrl}/api/rooms`, {
+      displayName: "Auto host",
+    });
+    const autoGuestMembership = await postMembership(
+      `${baseUrl}/api/rooms/${autoHostMembership.roomCode}/join`,
+      { displayName: "Auto requester" },
+    );
+    const continueHostMembership = await postMembership(`${baseUrl}/api/rooms`, {
+      displayName: "Continue host",
+    });
+    const continueRequesterMembership = await postMembership(
+      `${baseUrl}/api/rooms/${continueHostMembership.roomCode}/join`,
+      { displayName: "Continue requester" },
+    );
+    const continueOtherMembership = await postMembership(
+      `${baseUrl}/api/rooms/${continueHostMembership.roomCode}/join`,
+      { displayName: "Continue other" },
+    );
+
+    const autoHost = await connectDevice(baseUrl, autoHostMembership);
+    const autoGuest = await connectDevice(baseUrl, autoGuestMembership);
+    const continueHost = await connectDevice(baseUrl, continueHostMembership);
+    const continueRequester = await connectDevice(baseUrl, continueRequesterMembership);
+    const continueOther = await connectDevice(baseUrl, continueOtherMembership);
+
+    try {
+      await autoGuest.waitFor((message) => connectedCount(message) === 2);
+      await continueOther.waitFor((message) => connectedCount(message) === 3);
+
+      autoHost.send({
+        type: "queue_add",
+        video: integrationVideo("eeeeeeeeeee", "Auto-pause current"),
+      });
+      const autoQueued = await autoGuest.waitFor(
+        (message) => message.room?.queue.some(
+          (item) => item.video.title === "Auto-pause current",
+        ) === true,
+      );
+      const autoItemId = autoQueued.room?.queue.find(
+        (item) => item.video.title === "Auto-pause current",
+      )?.id;
+      assert.ok(autoItemId);
+      autoHost.send({ type: "play_item", itemId: autoItemId });
+      const autoPlaying = await autoGuest.waitFor(
+        (message) => message.room?.playback.video?.title === "Auto-pause current" &&
+          message.room.playback.status === "playing",
+      );
+      const autoPlayingRevision = autoPlaying.room?.playback.revision ?? 0;
+
+      continueHost.send({
+        type: "queue_add",
+        video: integrationVideo("fffffffffff", "Continue current"),
+      });
+      const continueQueued = await continueRequester.waitFor(
+        (message) => message.room?.queue.some(
+          (item) => item.video.title === "Continue current",
+        ) === true,
+      );
+      const continueItemId = continueQueued.room?.queue.find(
+        (item) => item.video.title === "Continue current",
+      )?.id;
+      assert.ok(continueItemId);
+      continueHost.send({ type: "play_item", itemId: continueItemId });
+      const continuePlaying = await continueOther.waitFor(
+        (message) => message.room?.playback.video?.title === "Continue current" &&
+          message.room.playback.status === "playing",
+      );
+      const continuePlayingRevision = continuePlaying.room?.playback.revision ?? 0;
+
+      const allVotedRequestedPromise = continueHost.waitForNext(
+        (message) => message.room?.pauseVote?.requestedBy ===
+          continueRequesterMembership.memberId,
+      );
+      continueRequester.send({ type: "pause_request" });
+      const allVotedRequested = await allVotedRequestedPromise;
+      const allVotedPollId = allVotedRequested.room?.pauseVote?.id;
+      assert.ok(allVotedPollId);
+      assert.equal(
+        (allVotedRequested.room?.pauseVote?.expiresAt ?? 0) -
+          (allVotedRequested.room?.pauseVote?.startedAt ?? 0),
+        10_000,
+      );
+
+      const firstNoPromise = continueOther.waitForNext(
+        (message) => message.room?.pauseVote?.noVotes === 1,
+      );
+      continueRequester.send({ type: "pause_vote", vote: "no", pollId: allVotedPollId });
+      await firstNoPromise;
+      const secondNoPromise = continueHost.waitForNext(
+        (message) => message.room?.pauseVote?.noVotes === 2,
+      );
+      continueOther.send({ type: "pause_vote", vote: "no", pollId: allVotedPollId });
+      await secondNoPromise;
+      const allVotedClosedPromise = continueRequester.waitForNext(
+        (message) => message.room?.playback.status === "playing" &&
+          message.room.playback.revision === continuePlayingRevision &&
+          message.room.pauseVote === undefined,
+      );
+      continueHost.send({ type: "pause_vote", vote: "no", pollId: allVotedPollId });
+      await allVotedClosedPromise;
+
+      const autoRequestedPromise = autoHost.waitForNext(
+        (message) => message.room?.pauseVote?.requestedBy === autoGuestMembership.memberId,
+      );
+      autoGuest.send({ type: "pause_request" });
+      const autoRequested = await autoRequestedPromise;
+      assert.equal(
+        (autoRequested.room?.pauseVote?.expiresAt ?? 0) -
+          (autoRequested.room?.pauseVote?.startedAt ?? 0),
+        10_000,
+      );
+      const autoPausedPromise = autoHost.waitForNext(
+        (message) => message.room?.playback.status === "paused" &&
+          message.room.playback.revision > autoPlayingRevision &&
+          message.room.pauseVote === undefined,
+        15_000,
+      );
+
+      const partialRequestedPromise = continueHost.waitForNext(
+        (message) => message.room?.pauseVote?.requestedBy ===
+          continueRequesterMembership.memberId,
+      );
+      continueRequester.send({ type: "pause_request" });
+      const partialRequested = await partialRequestedPromise;
+      const partialPollId = partialRequested.room?.pauseVote?.id;
+      assert.ok(partialPollId);
+      assert.equal(
+        (partialRequested.room?.pauseVote?.expiresAt ?? 0) -
+          (partialRequested.room?.pauseVote?.startedAt ?? 0),
+        10_000,
+      );
+      const partialVotePromise = continueOther.waitForNext(
+        (message) => message.room?.pauseVote?.yesVotes === 1,
+      );
+      continueRequester.send({ type: "pause_vote", vote: "yes", pollId: partialPollId });
+      await partialVotePromise;
+      const partialContinuedPromise = continueHost.waitForNext(
+        (message) => message.room?.playback.status === "playing" &&
+          message.room.playback.revision === continuePlayingRevision &&
+          message.room.pauseVote === undefined,
+        15_000,
+      );
+
+      const [autoPaused, partialContinued] = await Promise.all([
+        autoPausedPromise,
+        partialContinuedPromise,
+      ]);
+      assert.equal(autoPaused.room?.playback.video?.title, "Auto-pause current");
+      assert.equal(partialContinued.room?.playback.video?.title, "Continue current");
+    } finally {
+      await autoHost.close();
+      await autoGuest.close();
+      await continueHost.close();
+      await continueRequester.close();
+      await continueOther.close();
+    }
+  });
 });
+
+function integrationVideo(videoId: string, title: string) {
+  return {
+    videoId,
+    title,
+    channelTitle: "Integration channel",
+    thumbnailUrl: "https://example.test/thumbnail.jpg",
+  };
+}
 
 function connectedCount(message: WireMessage): number | undefined {
   return message.room?.members.filter((member) => member.connected).length;
@@ -194,9 +647,15 @@ async function postMembership(url: string, body: unknown): Promise<Membership> {
   return JSON.parse(responseBody) as Membership;
 }
 
-async function connectDevice(baseUrl: string, membership: Membership): Promise<TestDevice> {
+async function connectDevice(
+  baseUrl: string,
+  membership: Membership,
+  pauseVoteCapable = true,
+): Promise<TestDevice> {
+  const headers = membershipHeaders(membership);
+  if (pauseVoteCapable) headers["X-Muzik-Capabilities"] = "pause-vote-v1";
   const socket = new WebSocket(baseUrl.replace("http://", "ws://") + "/ws", {
-    headers: membershipHeaders(membership),
+    headers,
   });
   const device = new TestDevice(socket);
   await new Promise<void>((resolve, reject) => {

@@ -55,6 +55,7 @@ class RoomConnection(
                         header("X-Room-Code", membership.roomCode)
                         header("X-Member-Id", membership.memberId)
                         header("X-Member-Token", membership.memberToken)
+                        header("X-Muzik-Capabilities", "pause-vote-v1")
                     }) {
                         session = this
                         onStatus(ConnectionStatus.Connected)
@@ -119,15 +120,29 @@ class RoomConnection(
         }
     }
 
-    fun addToQueue(video: VideoSummary) = send(buildJsonObject {
-        put("type", "queue_add")
-        putJsonObject("video") {
-            put("videoId", video.videoId)
-            put("title", video.title)
-            put("channelTitle", video.channelTitle)
-            put("thumbnailUrl", video.thumbnailUrl)
+    fun addToQueue(video: VideoSummary, startPlayback: Boolean = false) {
+        val addMessage = buildJsonObject {
+            put("type", "queue_add")
+            putJsonObject("video") {
+                put("videoId", video.videoId)
+                put("title", video.title)
+                put("channelTitle", video.channelTitle)
+                put("thumbnailUrl", video.thumbnailUrl)
+                video.durationMs?.let { put("durationMs", it) }
+            }
         }
-    })
+        if (startPlayback) {
+            sendInOrder(
+                addMessage,
+                buildJsonObject {
+                    put("type", "playback_control")
+                    put("action", "play")
+                },
+            )
+        } else {
+            send(addMessage)
+        }
+    }
 
     fun vote(itemId: String, enabled: Boolean) = send(buildJsonObject {
         put("type", "queue_vote")
@@ -140,6 +155,11 @@ class RoomConnection(
         put("itemId", itemId)
     })
 
+    fun reorder(itemId: String, beforeItemId: String?) =
+        send(queueReorderMessage(itemId, beforeItemId))
+
+    fun playNext(itemId: String) = send(queuePlayNextMessage(itemId))
+
     fun playItem(itemId: String) = send(buildJsonObject {
         put("type", "play_item")
         put("itemId", itemId)
@@ -151,12 +171,25 @@ class RoomConnection(
         positionMs?.let { put("positionMs", it) }
     })
 
+    fun requestPause() = send(pauseRequestMessage())
+
+    fun votePause(vote: Boolean, pollId: String) = send(pauseVoteMessage(vote, pollId))
+
     fun voteToSkip() = send(buildJsonObject { put("type", "skip_vote") })
 
     private fun send(payload: JsonObject) {
+        sendInOrder(payload)
+    }
+
+    private fun sendInOrder(vararg payloads: JsonObject) {
         scope.launch {
             try {
-                session?.sendJson(payload) ?: onError("Room is reconnecting")
+                val activeSession = session
+                if (activeSession == null) {
+                    onError("Room is reconnecting")
+                    return@launch
+                }
+                payloads.forEach { activeSession.sendJson(it) }
             } catch (error: Exception) {
                 onError(error.message ?: "Unable to send room action")
             }
@@ -197,4 +230,26 @@ class RoomConnection(
             .replaceFirst("http://", "ws://")
         return "$schemeAdjusted/ws"
     }
+}
+
+internal fun queueReorderMessage(itemId: String, beforeItemId: String?): JsonObject =
+    buildJsonObject {
+        put("type", "queue_reorder")
+        put("itemId", itemId)
+        beforeItemId?.let { put("beforeItemId", it) }
+    }
+
+internal fun queuePlayNextMessage(itemId: String): JsonObject = buildJsonObject {
+    put("type", "queue_play_next")
+    put("itemId", itemId)
+}
+
+internal fun pauseRequestMessage(): JsonObject = buildJsonObject {
+    put("type", "pause_request")
+}
+
+internal fun pauseVoteMessage(vote: Boolean, pollId: String): JsonObject = buildJsonObject {
+    put("type", "pause_vote")
+    put("vote", if (vote) "yes" else "no")
+    put("pollId", pollId)
 }

@@ -117,8 +117,12 @@ Android-to-server messages:
 | `queue_add` | Add a validated YouTube video summary |
 | `queue_vote` | Add or remove the member's queue vote |
 | `queue_remove` | Host removes an item |
+| `queue_reorder` | Host reorders an item within an equal-vote tier |
+| `queue_play_next` | Host marks one queued item for the next transition |
 | `play_item` | Host immediately selects an item |
 | `playback_control` | Host sends `play`, `pause`, `seek`, or `next` |
+| `pause_request` | Member opens a pause vote, or pauses immediately when they are the only capable online client |
+| `pause_vote` | Capable client votes yes or no in the current pause poll |
 | `skip_vote` | Member votes to advance to the next item |
 | `leave_room` | Explicitly remove the member and their votes from the room |
 
@@ -126,7 +130,7 @@ Server-to-Android messages:
 
 | Type | Contents |
 |---|---|
-| `room_snapshot` | Members, queue, playback, skip count, and server time |
+| `room_snapshot` | Members, ranked queue, playback, history, pause/skip state, and server time |
 | `pong` | Echoed client time and current server time |
 | `error` | A rejected action's safe user-facing message |
 
@@ -141,9 +145,13 @@ limit.
 2. Android calls the authenticated Muzik search endpoint.
 3. The server calls the official YouTube Data API v3 `search` endpoint with:
    `type=video` and `videoEmbeddable=true`.
-4. The server returns video ID, title, channel name, and thumbnail URL. Results
-   are cached in memory for ten minutes to reduce quota consumption.
-5. A member adds a result to the shared queue. Only the YouTube ID and display
+4. The server optionally enriches those results through the official `videos`
+   endpoint so Android can display durations. Enrichment failure never discards
+   otherwise valid search results.
+5. The server returns video ID, title, channel name, thumbnail URL, and any
+   available duration. Fully enriched results are cached in memory for ten
+   minutes; partial results use a short cache so enrichment can recover.
+6. A member adds a result to the shared queue. Only the YouTube ID and display
    metadata are stored; no media passes through the Muzik server.
 
 `YOUTUBE_API_KEY` exists only on the server. It is never compiled into the APK.
@@ -219,7 +227,8 @@ differences. Ads cannot be synchronized or skipped by the application.
 Queue order is deterministic:
 
 1. Higher vote count first.
-2. Earlier addition first when vote counts are equal.
+2. Host-defined order first when vote counts are equal, falling back to earlier
+   addition order.
 
 The member adding a video automatically gives it one vote. Duplicate video IDs
 and invalid IDs are rejected. A room accepts up to 100 queue items and 50
@@ -232,10 +241,17 @@ members.
 | Start a selected queue item | Yes | No |
 | Play, pause, seek, or advance | Yes | No |
 | Remove a queue item | Yes | No |
+| Reorder equal-vote items / choose play-next | Yes | No |
+| Request or vote on a pause | Direct pause | Yes |
 | Vote to skip | Server accepts it; UI uses direct host controls | Yes |
 
 A skip succeeds at half of currently connected members, rounded up. Disconnecting
 removes that member's skip vote.
+
+Pause-vote support is capability-negotiated so already-installed APKs remain
+compatible. A pause requires strictly more than forty percent yes votes from
+connected capable clients. When only one capable client is online, their pause
+request takes effect immediately.
 
 If the host disconnects, the earliest still-connected member becomes host. If
 the room creator never establishes a WebSocket, the first connected member is

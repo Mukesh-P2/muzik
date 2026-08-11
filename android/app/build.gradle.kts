@@ -22,8 +22,8 @@ android {
         applicationId = "com.muzik.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
 
         buildConfigField("String", "SERVER_URL", "\"${muzikServerUrl.get()}\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -77,6 +77,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.webkit:webkit:1.12.1")
+    implementation("io.coil-kt:coil-compose:2.7.0")
 
     implementation("io.ktor:ktor-client-core:3.0.3")
     implementation("io.ktor:ktor-client-okhttp:3.0.3")

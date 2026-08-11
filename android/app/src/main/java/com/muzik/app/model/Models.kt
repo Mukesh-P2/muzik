@@ -17,6 +17,7 @@ data class VideoSummary(
     val title: String,
     val channelTitle: String = "",
     val thumbnailUrl: String = "",
+    val durationMs: Long? = null,
 )
 
 @Serializable
@@ -28,6 +29,7 @@ data class MemberSummary(
     val displayName: String,
     val isHost: Boolean,
     val connected: Boolean,
+    val songsAddedCount: Int = 0,
 )
 
 @Serializable
@@ -42,9 +44,21 @@ data class QueueItem(
     val id: String,
     val video: VideoSummary,
     val addedBy: String,
+    val addedByName: String? = null,
     val addedAt: Long,
     val voteCount: Int,
     val votedByMe: Boolean,
+    val isForcedNext: Boolean = false,
+)
+
+@Serializable
+data class HistoryItem(
+    val id: String,
+    val video: VideoSummary,
+    val addedBy: String,
+    val addedByName: String? = null,
+    val addedAt: Long,
+    val playedAt: Long,
 )
 
 @Serializable
@@ -54,6 +68,8 @@ data class PlaybackState(
     val positionMs: Long = 0,
     val anchorServerTimeMs: Long = 0,
     val revision: Long = 0,
+    val addedBy: String? = null,
+    val addedByName: String? = null,
 ) {
     fun expectedPositionMs(estimatedServerNowMs: Long): Long =
         if (status == "playing") {
@@ -71,6 +87,20 @@ data class SkipState(
 )
 
 @Serializable
+data class PauseVoteState(
+    val id: String? = null,
+    val requestedBy: String,
+    val requestedByName: String,
+    val yesVotes: Int,
+    val noVotes: Int,
+    val threshold: Int,
+    val eligibleVoters: Int? = null,
+    val myVote: String? = null,
+    val expiresAt: Long,
+    val startedAt: Long? = null,
+)
+
+@Serializable
 data class RoomSnapshot(
     val code: String,
     val serverTimeMs: Long,
@@ -79,6 +109,8 @@ data class RoomSnapshot(
     val queue: List<QueueItem>,
     val playback: PlaybackState,
     val skip: SkipState,
+    val history: List<HistoryItem> = emptyList(),
+    val pauseVote: PauseVoteState? = null,
 )
 
 @Serializable

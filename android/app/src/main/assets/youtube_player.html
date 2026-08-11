@@ -4,7 +4,31 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
     <style>
-        html, body, #player { width: 100%; height: 100%; margin: 0; background: #000; overflow: hidden; }
+        * { box-sizing: border-box; }
+        html, body {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            min-width: 0;
+            min-height: 0;
+            margin: 0;
+            padding: 0;
+            background: #000;
+            overflow: hidden;
+        }
+        #player {
+            position: absolute;
+            inset: 0;
+            display: block;
+            width: 100%;
+            height: 100%;
+            min-width: 0;
+            min-height: 0;
+            max-width: 100%;
+            max-height: 100%;
+            margin: 0;
+            border: 0;
+        }
     </style>
 </head>
 <body>
@@ -14,24 +38,61 @@
     let player = null;
     let ready = false;
 
+    function configurePlayerIframe() {
+        let iframe = null;
+        try {
+            iframe = player && player.getIframe ? player.getIframe() : null;
+        } catch (_) {}
+        iframe = iframe || document.querySelector('iframe#player');
+        if (!iframe) return;
+
+        // Chromium checks the iframe permission before forwarding the HTML
+        // fullscreen request to WebChromeClient. Keep both the modern Permissions
+        // Policy token and legacy boolean attributes for different WebView versions.
+        iframe.allowFullscreen = true;
+        iframe.setAttribute('allowfullscreen', '');
+        iframe.setAttribute('webkitallowfullscreen', '');
+        iframe.setAttribute('mozallowfullscreen', '');
+        iframe.setAttribute(
+            'allow',
+            'accelerometer; autoplay; clipboard-write; encrypted-media; fullscreen; ' +
+            'gyroscope; picture-in-picture; web-share'
+        );
+        iframe.setAttribute('scrolling', 'no');
+    }
+
+    // YT.Player replaces the host div with its iframe. Apply permissions as soon as
+    // that node appears, rather than waiting until the player has already initialized.
+    new MutationObserver(configurePlayerIframe).observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
     function onYouTubeIframeAPIReady() {
         player = new YT.Player('player', {
             width: '100%',
             height: '100%',
             playerVars: {
                 enablejsapi: 1,
+                fs: 1,
                 playsinline: 1,
                 rel: 0,
                 origin: 'https://com.muzik.app'
             },
             events: {
                 onReady: function () {
+                    configurePlayerIframe();
                     ready = true;
                     AndroidPlayer.onReady();
                 },
                 onStateChange: function (event) {
                     const position = safePosition();
-                    AndroidPlayer.onStateChanged(event.data, position, safeDuration());
+                    AndroidPlayer.onStateChanged(
+                        event.data,
+                        safeVideoId(),
+                        position,
+                        safeDuration()
+                    );
                 },
                 onError: function (event) {
                     AndroidPlayer.onError(event.data);
@@ -51,6 +112,13 @@
     function safeDuration() {
         try { return player && player.getDuration ? player.getDuration() : 0; }
         catch (_) { return 0; }
+    }
+
+    function safeVideoId() {
+        try {
+            const data = player && player.getVideoData ? player.getVideoData() : null;
+            return data && data.video_id ? String(data.video_id) : '';
+        } catch (_) { return ''; }
     }
 
     window.MuzikPlayer = {
