@@ -2,9 +2,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
+import { KeyedTaskCoalescer } from "./coalescer.js";
 import { connectRedisRoomPersistence } from "./persistence.js";
 import { RoomError, RoomManager } from "./room.js";
-import type { VideoSummary } from "./types.js";
+import type { ChatMessage, VideoSummary } from "./types.js";
+import {
+  MAX_INBOUND_MESSAGE_BYTES,
+  sendJsonWithBackpressure,
+} from "./websocket.js";
 import {
   fetchYouTubePlaylistVideos,
   fetchYouTubeSearchResults,
@@ -48,6 +53,8 @@ const searchCache = new Map<string, { expiresAt: number; results: VideoSummary[]
 const playlistCache = new Map<string, { expiresAt: number; results: VideoSummary[] }>();
 const rateLimits = new Map<string, { resetAt: number; count: number }>();
 const ROOM_IDLE_TTL_MS = 6 * 60 * 60 * 1_000;
+const ROOM_BROADCAST_COALESCE_MS = 20;
+const MAX_SOCKETS_PER_MEMBER = 4;
 const processStartedAt = Date.now();
 
 const server = createServer(async (request, response) => {
@@ -129,7 +136,10 @@ const server = createServer(async (request, response) => {
   }
 });
 
-const webSockets = new WebSocketServer({ noServer: true, maxPayload: 32_000 });
+const webSockets = new WebSocketServer({
+  noServer: true,
+  maxPayload: MAX_INBOUND_MESSAGE_BYTES,
+});
 
 server.on("upgrade", (request, socket, head) => {
   try {
@@ -169,7 +179,14 @@ webSockets.on(
       memberId: string;
       pauseVoteCapable: boolean;
     };
+    webSocket.on("error", (error) => {
+      console.warn(`WebSocket error in room ${roomCode}:`, error.message);
+    });
     const room = rooms.getRoom(roomCode);
+    if ((sockets.get(roomCode)?.get(memberId)?.size ?? 0) >= MAX_SOCKETS_PER_MEMBER) {
+      webSocket.close(1008, "Too many connections for this room member");
+      return;
+    }
     if (pauseVoteCapable) pauseVoteCapableSockets.add(webSocket);
     addSocket(roomCode, memberId, webSocket);
     responsiveSockets.add(webSocket);
@@ -184,6 +201,7 @@ webSockets.on(
     let messageCount = 0;
 
     webSocket.on("message", (data) => {
+      let actionRequestId: string | undefined;
       try {
         const now = Date.now();
         if (now - messageWindowStartedAt >= 60_000) {
@@ -208,8 +226,29 @@ webSockets.on(
 
         if (message.type === "queue_add") {
           room.addToQueue(memberId, message.video as VideoSummary);
+        } else if (message.type === "queue_add_many") {
+          actionRequestId = requiredActionRequestId(message.requestId);
+          if (typeof message.startPlayback !== "boolean") {
+            throw new RoomError("startPlayback must be a boolean");
+          }
+          const imported = room.addManyToQueue(
+            memberId,
+            message.videos as VideoSummary[],
+            message.startPlayback,
+          );
+          send(webSocket, {
+            type: "queue_import_result",
+            requestId: actionRequestId,
+            addedCount: imported.length,
+            startedPlayback: message.startPlayback,
+          });
         } else if (message.type === "chat_send") {
-          room.sendChat(memberId, String(message.text ?? ""));
+          const chatMessage = room.sendChat(memberId, String(message.text ?? ""));
+          broadcastChatMessage(roomCode, chatMessage);
+          // Legacy clients only understand room snapshots. Keep the incremental
+          // event as the fast path while still updating already-installed APKs.
+          roomMutationBroadcasts.schedule(roomCode);
+          return;
         } else if (message.type === "chat_delete") {
           room.deleteChatMessage(memberId, String(message.messageId ?? ""));
         } else if (message.type === "chat_mute") {
@@ -254,7 +293,7 @@ webSockets.on(
         } else if (message.type === "leave_room") {
           room.removeMember(memberId);
           closeMemberSockets(roomCode, memberId);
-          broadcastRoom(roomCode);
+          roomMutationBroadcasts.schedule(roomCode);
           return;
         } else if (message.type === "request_snapshot") {
           send(webSocket, { type: "room_snapshot", room: room.publicStateFor(memberId) });
@@ -262,7 +301,7 @@ webSockets.on(
         } else {
           throw new RoomError("Unknown message type");
         }
-        broadcastRoom(roomCode);
+        roomMutationBroadcasts.schedule(roomCode);
       } catch (error) {
         if (!(error instanceof RoomError) && !(error instanceof SyntaxError)) {
           console.warn("Unhandled WebSocket message error:", error);
@@ -270,25 +309,26 @@ webSockets.on(
         send(webSocket, {
           type: "error",
           message: error instanceof RoomError ? error.message : "Invalid room message",
+          ...(actionRequestId ? { requestId: actionRequestId } : {}),
         });
       }
     });
 
     webSocket.on("close", () => {
+      const wasConnected = hasSocket(roomCode, memberId);
+      const wasPauseVoteCapable = hasPauseVoteCapableSocket(roomCode, memberId);
       removeSocket(roomCode, memberId, webSocket);
-      if (room.hasMember(memberId) && !hasSocket(roomCode, memberId)) {
-        room.setConnected(memberId, false);
-      } else if (room.hasMember(memberId)) {
-        room.setPauseVoteCapable(
-          memberId,
-          hasPauseVoteCapableSocket(roomCode, memberId),
-        );
-      }
-      broadcastRoom(roomCode);
-    });
+      if (!room.hasMember(memberId)) return;
 
-    webSocket.on("error", (error) => {
-      console.warn(`WebSocket error in room ${roomCode}:`, error.message);
+      const isConnected = hasSocket(roomCode, memberId);
+      const isPauseVoteCapable = hasPauseVoteCapableSocket(roomCode, memberId);
+      if (wasConnected && !isConnected) {
+        room.setConnected(memberId, false);
+        roomMutationBroadcasts.schedule(roomCode);
+      } else if (wasPauseVoteCapable !== isPauseVoteCapable) {
+        room.setPauseVoteCapable(memberId, isPauseVoteCapable);
+        roomMutationBroadcasts.schedule(roomCode);
+      }
     });
   },
 );
@@ -305,8 +345,14 @@ const heartbeatTimer = setInterval(() => {
 }, 30_000);
 heartbeatTimer.unref();
 
+const roomMutationBroadcasts = new KeyedTaskCoalescer(
+  ROOM_BROADCAST_COALESCE_MS,
+  broadcastRoom,
+);
+
 const cleanupTimer = setInterval(() => {
   for (const roomCode of rooms.pruneInactiveRooms(ROOM_IDLE_TTL_MS)) {
+    roomMutationBroadcasts.cancel(roomCode);
     sockets.delete(roomCode);
   }
   const now = Date.now();
@@ -336,6 +382,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     clearInterval(heartbeatTimer);
     clearInterval(cleanupTimer);
     clearInterval(pauseVoteTimer);
+    roomMutationBroadcasts.cancelAll();
     webSockets.close();
     server.close(() => {
       void roomPersistence?.close().finally(() => process.exit(0));
@@ -412,6 +459,13 @@ function broadcastRoom(roomCode: string): void {
   }
 }
 
+function broadcastChatMessage(roomCode: string, message: ChatMessage): void {
+  const payload = { type: "chat_message", message };
+  for (const memberSockets of sockets.get(roomCode)?.values() ?? []) {
+    for (const socket of memberSockets) send(socket, payload);
+  }
+}
+
 function addSocket(roomCode: string, memberId: string, socket: WebSocket): void {
   let roomSockets = sockets.get(roomCode);
   if (!roomSockets) sockets.set(roomCode, (roomSockets = new Map()));
@@ -444,7 +498,7 @@ function closeMemberSockets(roomCode: string, memberId: string): void {
 }
 
 function send(socket: WebSocket, value: unknown): void {
-  if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value));
+  sendJsonWithBackpressure(socket, value);
 }
 
 function setCors(response: ServerResponse): void {
@@ -545,6 +599,13 @@ function numberOrUndefined(value: unknown): number | undefined {
 function optionalNullableString(value: unknown): string | null | undefined {
   if (value === undefined || value === null || typeof value === "string") return value;
   throw new RoomError("beforeItemId must be a string or null");
+}
+
+function requiredActionRequestId(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(value)) {
+    throw new RoomError("A valid action request ID is required");
+  }
+  return value;
 }
 
 function parsePort(value: string | undefined): number {

@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { after, before, describe, it } from "node:test";
 import { WebSocket } from "ws";
+import { MAX_INBOUND_MESSAGE_BYTES } from "../src/websocket.js";
 
 interface Membership {
   roomCode: string;
@@ -11,9 +12,20 @@ interface Membership {
   memberToken: string;
 }
 
+interface WireChatMessage {
+  id: string;
+  memberId: string;
+  displayName: string;
+  text: string;
+  sentAt: number;
+}
+
 interface WireMessage {
   type?: string;
-  message?: string;
+  message?: string | WireChatMessage;
+  requestId?: string;
+  addedCount?: number;
+  startedPlayback?: boolean;
   room?: {
     me: { id: string; isHost: boolean };
     members: Array<{
@@ -147,7 +159,12 @@ describe("HTTP and WebSocket integration", () => {
       ["--import", "tsx", "src/index.ts"],
       {
         cwd: process.cwd(),
-        env: { ...process.env, PORT: String(port), YOUTUBE_API_KEY: "" },
+        env: {
+          ...process.env,
+          PORT: String(port),
+          YOUTUBE_API_KEY: "",
+          REDIS_URL: "",
+        },
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -252,16 +269,20 @@ describe("HTTP and WebSocket integration", () => {
       assert.deepEqual(attributed.room?.history, []);
 
       guest.send({ type: "chat_send", text: "Hello from integration" });
-      const chatted = await host.waitFor(
-        (message) => message.room?.chat?.some(
-          (chat) => chat.text === "Hello from integration" &&
-            chat.memberId === guestMembership.memberId,
-        ) === true,
-      );
-      const chatId = chatted.room?.chat?.find(
-        (chat) => chat.text === "Hello from integration",
-      )?.id;
+      const chatted = await host.waitFor((message) => {
+        const chat = wireChatMessage(message);
+        return message.type === "chat_message" &&
+          chat?.text === "Hello from integration" &&
+          chat.memberId === guestMembership.memberId;
+      });
+      assert.equal(chatted.room, undefined);
+      const chatId = wireChatMessage(chatted)?.id;
       assert.ok(chatId);
+      const legacyChatSnapshot = await host.waitFor(
+        (message) => message.type === "room_snapshot" &&
+          message.room?.chat?.some((chat) => chat.id === chatId) === true,
+      );
+      assert.equal(legacyChatSnapshot.room?.chat?.at(-1)?.text, "Hello from integration");
 
       host.send({ type: "chat_mute", memberId: guestMembership.memberId, muted: true });
       await guest.waitFor(
@@ -307,6 +328,153 @@ describe("HTTP and WebSocket integration", () => {
     } finally {
       await host.close();
       await guest.close();
+    }
+  });
+
+  it("imports a playlist batch atomically and acknowledges the requester", async () => {
+    const membership = await postMembership(`${baseUrl}/api/rooms`, {
+      displayName: "Playlist host",
+    });
+    const host = await connectDevice(baseUrl, membership);
+    try {
+      await host.waitFor((message) => message.room?.me.id === membership.memberId);
+      const resultPromise = host.waitForNext(
+        (message) => message.type === "queue_import_result" &&
+          message.requestId === "import-success",
+      );
+      host.send({
+        type: "queue_add_many",
+        requestId: "import-success",
+        startPlayback: true,
+        videos: [
+          integrationVideo("eeeeeeeeeee", "Imported first"),
+          integrationVideo("fffffffffff", "Imported second"),
+        ],
+      });
+      const result = await resultPromise;
+      assert.equal(result.addedCount, 2);
+      assert.equal(result.startedPlayback, true);
+      await host.waitFor(
+        (message) => message.room?.playback.video?.videoId === "eeeeeeeeeee" &&
+          message.room.queue.some((item) => item.video.videoId === "fffffffffff"),
+      );
+
+      const errorPromise = host.waitForNext(
+        (message) => message.type === "error" &&
+          message.requestId === "import-rejected",
+      );
+      host.send({
+        type: "queue_add_many",
+        requestId: "import-rejected",
+        startPlayback: false,
+        videos: [
+          integrationVideo("ggggggggggg", "Must not be added"),
+          integrationVideo("eeeeeeeeeee", "Duplicate current video"),
+        ],
+      });
+      const rejected = await errorPromise;
+      assert.equal(
+        rejected.message,
+        "Playlist contains a video that is already in this room",
+      );
+
+      const malformedErrorPromise = host.waitForNext(
+        (message) => message.type === "error" &&
+          message.requestId === "import-malformed",
+      );
+      host.send({
+        type: "queue_add_many",
+        requestId: "import-malformed",
+        startPlayback: false,
+        videos: [{
+          ...integrationVideo("hhhhhhhhhhh", "Malformed metadata"),
+          title: { nested: "not a string" },
+        }],
+      });
+      const malformed = await malformedErrorPromise;
+      assert.equal(malformed.message, "Valid YouTube video metadata is required");
+
+      const snapshotPromise = host.waitForNext(
+        (message) => message.type === "room_snapshot",
+      );
+      host.send({ type: "request_snapshot" });
+      const snapshot = await snapshotPromise;
+      assert.equal(
+        snapshot.room?.queue.some((item) => item.video.videoId === "ggggggggggg"),
+        false,
+      );
+      assert.equal(
+        snapshot.room?.queue.some((item) => item.video.videoId === "hhhhhhhhhhh"),
+        false,
+      );
+    } finally {
+      await host.close();
+    }
+  });
+
+  it("accepts a maximum-size valid playlist batch over the wire", async () => {
+    const membership = await postMembership(`${baseUrl}/api/rooms`, {
+      displayName: "Boundary host",
+    });
+    const host = await connectDevice(baseUrl, membership);
+    try {
+      await host.waitFor((message) => message.room?.me.id === membership.memberId);
+      const videos = Array.from({ length: 50 }, (_, index) => ({
+        videoId: index.toString(36).padStart(11, "0"),
+        title: "\u0000".repeat(200),
+        channelTitle: "\u0000".repeat(100),
+        thumbnailUrl: "\u0000".repeat(500),
+        durationMs: 86_400_000,
+      }));
+      const request = {
+        type: "queue_add_many",
+        requestId: "import-boundary",
+        startPlayback: false,
+        videos,
+      };
+      const requestBytes = Buffer.byteLength(JSON.stringify(request), "utf8");
+      assert.ok(requestBytes > 64_000);
+      assert.ok(requestBytes <= MAX_INBOUND_MESSAGE_BYTES);
+
+      const resultPromise = host.waitForNext(
+        (message) => message.type === "queue_import_result" &&
+          message.requestId === "import-boundary",
+      );
+      host.send(request);
+      assert.equal((await resultPromise).addedCount, 50);
+      await host.waitFor((message) => message.room?.queue.length === 50);
+    } finally {
+      await host.close();
+    }
+  });
+
+  it("bounds parallel WebSocket fan-out per room membership", async () => {
+    const membership = await postMembership(`${baseUrl}/api/rooms`, {
+      displayName: "Socket cap host",
+    });
+    const devices: TestDevice[] = [];
+    try {
+      for (let index = 0; index < 4; index += 1) {
+        devices.push(await connectDevice(baseUrl, membership));
+      }
+      const extraSocket = new WebSocket(
+        baseUrl.replace("http://", "ws://") + "/ws",
+        { headers: membershipHeaders(membership) },
+      );
+      const closed = new Promise<{ code: number; reason: string }>((resolve, reject) => {
+        extraSocket.once("close", (code, reason) => resolve({
+          code,
+          reason: reason.toString(),
+        }));
+        extraSocket.once("error", reject);
+      });
+      const result = await closed;
+      assert.deepEqual(result, {
+        code: 1008,
+        reason: "Too many connections for this room member",
+      });
+    } finally {
+      await Promise.all(devices.map(async (device) => await device.close()));
     }
   });
 
@@ -693,6 +861,10 @@ function integrationVideo(videoId: string, title: string) {
 
 function connectedCount(message: WireMessage): number | undefined {
   return message.room?.members.filter((member) => member.connected).length;
+}
+
+function wireChatMessage(message: WireMessage): WireChatMessage | undefined {
+  return typeof message.message === "object" ? message.message : undefined;
 }
 
 async function postMembership(url: string, body: unknown): Promise<Membership> {

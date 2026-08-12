@@ -120,6 +120,6 @@ class MainActivity : ComponentActivity() {
 
     private fun applyInvite(intent: Intent?) {
         if (intent?.action != Intent.ACTION_VIEW) return
-        intent.data?.getQueryParameter("room")?.let(viewModel::setRoomCode)
+        intent.data?.getQueryParameter("room")?.let(viewModel::handleInvite)
     }
 }

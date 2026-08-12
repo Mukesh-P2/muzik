@@ -147,6 +147,50 @@ describe("Room", () => {
     assert.equal(room.publicStateFor(host.id).queue.length, 0);
   });
 
+  it("imports a playlist atomically and can start idle host playback", () => {
+    const room = new Room("ABC123");
+    const host = room.addMember("Host", true);
+
+    const imported = room.addManyToQueue(
+      host.id,
+      [
+        video("aaaaaaaaaaa", "First"),
+        video("bbbbbbbbbbb", "Second"),
+      ],
+      true,
+      1_000,
+    );
+
+    assert.equal(imported.length, 2);
+    assert.equal(room.playback.video?.title, "First");
+    assert.equal(room.publicStateFor(host.id).queue[0]?.video.title, "Second");
+    assert.equal(room.publicStateFor(host.id).members[0]?.songsAddedCount, 2);
+  });
+
+  it("rejects an invalid playlist batch without adding any of it", () => {
+    const room = new Room("ABC123");
+    const host = room.addMember("Host", true);
+    const guest = room.addMember("Guest");
+    room.addToQueue(host.id, video("aaaaaaaaaaa", "Existing"));
+    const before = room.publicStateFor(host.id);
+
+    assert.throws(
+      () => room.addManyToQueue(host.id, [
+        video("bbbbbbbbbbb", "Fresh"),
+        video("aaaaaaaaaaa", "Duplicate"),
+      ]),
+      (error) => error instanceof RoomError && error.statusCode === 409,
+    );
+    assert.deepEqual(room.publicStateFor(host.id).queue, before.queue);
+    assert.equal(room.publicStateFor(host.id).members[0]?.songsAddedCount, 1);
+
+    assert.throws(
+      () => room.addManyToQueue(guest.id, [video("ccccccccccc", "Guest")], true),
+      (error) => error instanceof RoomError && error.statusCode === 403,
+    );
+    assert.deepEqual(room.publicStateFor(host.id).queue, before.queue);
+  });
+
   it("rejects playback control from a non-host", () => {
     const room = new Room("ABC123");
     room.addMember("Host", true);
@@ -223,6 +267,13 @@ describe("Room", () => {
       () => room.addToQueue(host.id, video("short", "Invalid")),
       (error) => error instanceof RoomError && error.statusCode === 400,
     );
+    assert.throws(
+      () => room.addToQueue(host.id, {
+        ...video("aaaaaaaaaaa", "Numeric ID"),
+        videoId: 12_345_678_901 as unknown as string,
+      }),
+      (error) => error instanceof RoomError && error.statusCode === 400,
+    );
     room.addToQueue(host.id, video("aaaaaaaaaaa", "First"));
     assert.throws(
       () => room.addToQueue(host.id, video("aaaaaaaaaaa", "Duplicate")),
@@ -230,7 +281,7 @@ describe("Room", () => {
     );
   });
 
-  it("preserves and bounds optional duration metadata in room snapshots", () => {
+  it("preserves, bounds, and validates optional duration metadata", () => {
     const room = new Room("ABC123");
     const host = room.addMember("Host", true);
     const legacy = room.addToQueue(host.id, video("aaaaaaaaaaa", "Legacy"));
@@ -242,15 +293,17 @@ describe("Room", () => {
       ...video("ccccccccccc", "Bounded"),
       durationMs: Number.MAX_VALUE,
     });
-    const invalid = room.addToQueue(host.id, {
-      ...video("ddddddddddd", "Invalid"),
-      durationMs: Number.NaN,
-    });
+    assert.throws(
+      () => room.addToQueue(host.id, {
+        ...video("ddddddddddd", "Invalid"),
+        durationMs: Number.NaN,
+      }),
+      (error) => error instanceof RoomError && error.statusCode === 400,
+    );
 
     assert.equal("durationMs" in legacy.video, false);
     assert.equal(withDuration.video.durationMs, 123_457);
     assert.equal(bounded.video.durationMs, 24 * 60 * 60 * 1_000);
-    assert.equal("durationMs" in invalid.video, false);
     const snapshot = room.publicStateFor(host.id);
     assert.equal(snapshot.queue.find((item) => item.id === withDuration.id)?.video.durationMs, 123_457);
 
@@ -628,6 +681,28 @@ describe("Room", () => {
     assert.equal(restored.history[0]?.video.title, "Current");
   });
 
+  it("canonicalizes restored objects so unknown persisted fields cannot escape", () => {
+    const source = new Room("ABC123");
+    const host = source.addMember("Host", true);
+    source.setConnected(host.id, true, 500);
+    const current = source.addToQueue(host.id, video("aaaaaaaaaaa", "Current"));
+    source.playQueueItem(host.id, current.id, 1_000);
+    source.addToQueue(host.id, video("bbbbbbbbbbb", "Queued"));
+    source.sendChat(host.id, "Persisted", 2_000);
+    const stored = JSON.parse(JSON.stringify(source.toStoredState())) as Record<string, unknown>;
+    const marker = "must-not-survive";
+    (stored.members as Array<Record<string, unknown>>)[0]!.unbounded = marker;
+    (stored.queue as Array<Record<string, unknown>>)[0]!.unbounded = marker;
+    ((stored.queue as Array<Record<string, unknown>>)[0]!.video as Record<string, unknown>)
+      .unbounded = marker;
+    (stored.chat as Array<Record<string, unknown>>)[0]!.unbounded = marker;
+    (stored.playback as Record<string, unknown>).unbounded = marker;
+
+    const restored = Room.fromStoredState(stored);
+    assert.equal(JSON.stringify(restored.toStoredState()).includes(marker), false);
+    assert.equal(JSON.stringify(restored.publicStateFor(host.id)).includes(marker), false);
+  });
+
   it("removes a disconnected member's skip vote", () => {
     const room = new Room("ABC123");
     const host = room.addMember("Host", true);
@@ -726,6 +801,116 @@ describe("RoomManager", () => {
     const rooms = new RoomManager();
     assert.throws(
       () => rooms.restoreRoom({ version: 1, code: "BAD" }),
+      (error) => error instanceof RoomError && error.message === "Invalid stored room state",
+    );
+  });
+
+  it("rejects malformed nested persisted room data", () => {
+    const source = new Room("ABC123");
+    const host = source.addMember("Host", true);
+    source.addToQueue(host.id, video("aaaaaaaaaaa", "Queued"));
+    const stored = JSON.parse(JSON.stringify(source.toStoredState())) as Record<string, unknown>;
+    const members = stored.members as unknown[];
+    const queue = stored.queue as Array<Record<string, unknown>>;
+    const secondQueueItem = {
+      ...queue[0],
+      id: "second-queue-item",
+      video: video("bbbbbbbbbbb", "Second"),
+      orderKey: 1,
+    };
+    const malformedStates = [
+      { ...stored, playback: [] },
+      { ...stored, history: ["not a history item"] },
+      { ...stored, chat: [42] },
+      { ...stored, currentPlaybackItem: {} },
+      { ...stored, members: [...members, members[0]] },
+      {
+        ...stored,
+        members: [
+          ...members.map((member) => ({
+            ...(member as Record<string, unknown>),
+            isHost: true,
+          })),
+          {
+            ...(members[0] as Record<string, unknown>),
+            id: "second-host",
+            token: "second-token",
+            isHost: true,
+          },
+        ],
+      },
+      {
+        ...stored,
+        playback: {
+          ...(stored.playback as Record<string, unknown>),
+          status: "playing",
+          video: null,
+        },
+      },
+      {
+        ...stored,
+        playback: {
+          ...(stored.playback as Record<string, unknown>),
+          status: "idle",
+          video: (queue[0]?.video as unknown),
+        },
+      },
+      {
+        ...stored,
+        queue: [{ ...queue[0], votes: [host.id, "unknown-member"] }],
+      },
+      {
+        ...stored,
+        queue: [queue[0], { ...secondQueueItem, video: queue[0]?.video }],
+        nextOrderKey: 2,
+      },
+      {
+        ...stored,
+        queue: [queue[0], { ...secondQueueItem, orderKey: queue[0]?.orderKey }],
+        nextOrderKey: 2,
+      },
+      {
+        ...stored,
+        history: [{ ...queue[0], playedAt: 1_000 }],
+      },
+      { ...stored, nextOrderKey: 0 },
+      {
+        ...stored,
+        playback: {
+          ...(stored.playback as Record<string, unknown>),
+          revision: Number.MAX_SAFE_INTEGER,
+        },
+      },
+      { ...stored, mutedMemberIds: ["unknown-member"] },
+    ];
+
+    for (const malformed of malformedStates) {
+      assert.throws(
+        () => Room.fromStoredState(malformed),
+        (error) => error instanceof RoomError && error.message === "Invalid stored room state",
+      );
+    }
+
+    const playingSource = new Room("DEF456");
+    const playingHost = playingSource.addMember("Host", true);
+    const playingItem = playingSource.addToQueue(
+      playingHost.id,
+      video("ccccccccccc", "Playing"),
+    );
+    playingSource.playQueueItem(playingHost.id, playingItem.id, 2_000);
+    const playingStored = JSON.parse(
+      JSON.stringify(playingSource.toStoredState()),
+    ) as Record<string, unknown>;
+    const playback = playingStored.playback as Record<string, unknown>;
+    const playbackVideo = playback.video as Record<string, unknown>;
+    assert.throws(
+      () => Room.fromStoredState({
+        ...playingStored,
+        playback: {
+          ...playback,
+          video: { ...playbackVideo, title: "Mismatched metadata" },
+        },
+      }),
       (error) => error instanceof RoomError && error.message === "Invalid stored room state",
     );
   });

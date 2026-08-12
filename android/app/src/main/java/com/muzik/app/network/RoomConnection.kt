@@ -1,13 +1,17 @@
 package com.muzik.app.network
 
 import com.muzik.app.model.ConnectionStatus
+import com.muzik.app.model.ChatMessage
+import com.muzik.app.model.ChatMessageEnvelope
 import com.muzik.app.model.Membership
 import com.muzik.app.model.PongEnvelope
+import com.muzik.app.model.QueueImportResultEnvelope
 import com.muzik.app.model.RoomSnapshot
 import com.muzik.app.model.RoomSnapshotEnvelope
 import com.muzik.app.model.VideoSummary
 import io.ktor.client.plugins.websocket.DefaultClientWebSocketSession
 import io.ktor.client.plugins.websocket.webSocket
+import io.ktor.client.plugins.ResponseException
 import io.ktor.client.request.header
 import io.ktor.client.request.url
 import io.ktor.websocket.Frame
@@ -34,8 +38,12 @@ class RoomConnection(
     private val membership: Membership,
     private val scope: CoroutineScope,
     private val onSnapshot: (RoomSnapshot) -> Unit,
+    private val onChatMessage: (ChatMessage) -> Unit,
+    private val onQueueImportResult: (QueueImportResultEnvelope) -> Unit,
+    private val onActionError: (String, String) -> Unit,
     private val onStatus: (ConnectionStatus) -> Unit,
     private val onClockOffset: (Long) -> Unit,
+    private val onMembershipInvalid: () -> Unit,
     private val onError: (String) -> Unit,
 ) {
     private var connectionJob: Job? = null
@@ -85,6 +93,11 @@ class RoomConnection(
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
+                    if (isTerminalMembershipRejection(error)) {
+                        onStatus(ConnectionStatus.Disconnected)
+                        onMembershipInvalid()
+                        return@launch
+                    }
                     val message = error.message ?: "Room connection failed"
                     if (message != lastConnectionError) onError(message)
                     lastConnectionError = message
@@ -135,16 +148,24 @@ class RoomConnection(
         }
     }
 
-    fun addManyToQueue(videos: List<VideoSummary>, startPlayback: Boolean = false) {
-        if (videos.isEmpty()) return
-        val messages = videos.map(::queueAddMessage).toMutableList()
-        if (startPlayback) {
-            messages += buildJsonObject {
-                put("type", "playback_control")
-                put("action", "play")
-            }
+    suspend fun addManyToQueue(
+        requestId: String,
+        videos: List<VideoSummary>,
+        startPlayback: Boolean = false,
+    ): Boolean {
+        if (videos.isEmpty()) return false
+        val activeSession = session
+        if (activeSession == null) {
+            onError("Room is reconnecting")
+            return false
         }
-        sendInOrder(*messages.toTypedArray())
+        return try {
+            activeSession.sendJson(queueAddManyMessage(requestId, videos, startPlayback))
+            true
+        } catch (error: Exception) {
+            onError(error.message ?: "Unable to send playlist import")
+            false
+        }
     }
 
     fun vote(itemId: String, enabled: Boolean) = send(buildJsonObject {
@@ -182,7 +203,7 @@ class RoomConnection(
 
     fun voteToSkip() = send(buildJsonObject { put("type", "skip_vote") })
 
-    fun sendChat(text: String) = send(chatSendMessage(text))
+    fun sendChat(text: String): Boolean = enqueueSend(chatSendMessage(text))
 
     fun deleteChat(messageId: String) = send(chatDeleteMessage(messageId))
 
@@ -194,18 +215,23 @@ class RoomConnection(
     }
 
     private fun sendInOrder(vararg payloads: JsonObject) {
+        enqueueSend(*payloads)
+    }
+
+    private fun enqueueSend(vararg payloads: JsonObject): Boolean {
+        val activeSession = session
+        if (activeSession == null) {
+            onError("Room is reconnecting")
+            return false
+        }
         scope.launch {
             try {
-                val activeSession = session
-                if (activeSession == null) {
-                    onError("Room is reconnecting")
-                    return@launch
-                }
                 payloads.forEach { activeSession.sendJson(it) }
             } catch (error: Exception) {
                 onError(error.message ?: "Unable to send room action")
             }
         }
+        return true
     }
 
     private suspend fun DefaultClientWebSocketSession.sendJson(payload: JsonObject) {
@@ -220,6 +246,17 @@ class RoomConnection(
                 val envelope = client.json.decodeFromJsonElement(RoomSnapshotEnvelope.serializer(), element)
                 onSnapshot(envelope.room)
             }
+            "chat_message" -> {
+                val envelope = client.json.decodeFromJsonElement(ChatMessageEnvelope.serializer(), element)
+                onChatMessage(envelope.message)
+            }
+            "queue_import_result" -> {
+                val envelope = client.json.decodeFromJsonElement(
+                    QueueImportResultEnvelope.serializer(),
+                    element,
+                )
+                onQueueImportResult(envelope)
+            }
             "pong" -> {
                 val pong = client.json.decodeFromJsonElement(PongEnvelope.serializer(), element)
                 val receivedAt = System.currentTimeMillis()
@@ -231,7 +268,12 @@ class RoomConnection(
             }
             "error" -> {
                 val message = element.jsonObject["message"]?.jsonPrimitive?.content
-                onError(message ?: "Room action failed")
+                val requestId = element.jsonObject["requestId"]?.jsonPrimitive?.content
+                if (requestId != null) {
+                    onActionError(requestId, message ?: "Room action failed")
+                } else {
+                    onError(message ?: "Room action failed")
+                }
             }
         }
     }
@@ -242,6 +284,23 @@ class RoomConnection(
             .replaceFirst("http://", "ws://")
         return "$schemeAdjusted/ws"
     }
+}
+
+internal fun isTerminalMembershipRejection(error: Throwable): Boolean =
+    generateSequence(error) { current ->
+        current.cause?.takeUnless { cause -> cause === current }
+    }.take(8).any { candidate ->
+        val responseStatus = (candidate as? ResponseException)?.response?.status?.value
+        responseStatus == 401 || isUnauthorizedWebSocketHandshake(candidate.message)
+    }
+
+private fun isUnauthorizedWebSocketHandshake(message: String?): Boolean {
+    val normalized = message?.lowercase() ?: return false
+    val identifiesWebSocketHandshake =
+        "handshake" in normalized || "websocket" in normalized || "web socket" in normalized
+    val identifiesUnauthorized =
+        Regex("\\b401\\b").containsMatchIn(normalized) || "unauthorized" in normalized
+    return identifiesWebSocketHandshake && identifiesUnauthorized
 }
 
 internal fun queueReorderMessage(itemId: String, beforeItemId: String?): JsonObject =
@@ -260,6 +319,25 @@ internal fun queueAddMessage(video: VideoSummary): JsonObject = buildJsonObject 
         put("thumbnailUrl", video.thumbnailUrl)
         video.durationMs?.let { put("durationMs", it) }
     }
+}
+
+internal fun queueAddManyMessage(
+    requestId: String,
+    videos: List<VideoSummary>,
+    startPlayback: Boolean,
+): JsonObject = buildJsonObject {
+    put("type", "queue_add_many")
+    put("requestId", requestId)
+    put("startPlayback", startPlayback)
+    put("videos", kotlinx.serialization.json.JsonArray(videos.map(::videoMessage)))
+}
+
+private fun videoMessage(video: VideoSummary): JsonObject = buildJsonObject {
+    put("videoId", video.videoId)
+    put("title", video.title)
+    put("channelTitle", video.channelTitle)
+    put("thumbnailUrl", video.thumbnailUrl)
+    video.durationMs?.let { put("durationMs", it) }
 }
 
 internal fun queuePlayNextMessage(itemId: String): JsonObject = buildJsonObject {

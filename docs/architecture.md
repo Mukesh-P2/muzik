@@ -110,9 +110,12 @@ rate limits reduce accidental abuse of the public service and YouTube quota.
 
 ## 6. WebSocket protocol
 
-The server broadcasts `room_snapshot` after a connection or successful room
-mutation. Snapshots are personalized because `me.isHost` and `votedByMe` depend
-on the receiving member.
+The server sends `room_snapshot` on connection/request and coalesces bursty
+state mutations into at most one full snapshot per room every 20 ms. Snapshots
+are personalized because `me.isHost` and `votedByMe` depend on the receiving
+member. Successful chat sends use a lightweight `chat_message` event instead of
+waiting for the coalesced snapshot; that snapshot is still sent for legacy
+clients and remains authoritative.
 
 Android-to-server messages:
 
@@ -121,6 +124,7 @@ Android-to-server messages:
 | `ping` | Clock-offset sample request |
 | `request_snapshot` | Request current room state |
 | `queue_add` | Add a validated YouTube video summary |
+| `queue_add_many` | Atomically add up to 50 validated playlist videos and optionally start idle host playback |
 | `queue_clear` | Host removes every queued item without stopping playback |
 | `queue_vote` | Add or remove the member's queue vote |
 | `queue_remove` | Host removes an item |
@@ -140,7 +144,9 @@ Server-to-Android messages:
 
 | Type | Contents |
 |---|---|
-| `room_snapshot` | Members, ranked queue, playback, history, pause/skip state, and server time |
+| `room_snapshot` | Members, ranked queue, playback, history, chat, pause/skip state, and server time |
+| `chat_message` | One newly accepted room-chat message |
+| `queue_import_result` | Correlated acknowledgement for a successful atomic playlist import |
 | `pong` | Echoed client time and current server time |
 | `error` | A rejected action's safe user-facing message |
 
@@ -292,11 +298,19 @@ elected, preventing an unusable room.
 
 ## 11. Server memory and lifecycle
 
-Rooms always operate in the Node process. When `REDIS_URL` is configured, each
-mutation also stores a versioned room record in Redis and startup restores room
-membership credentials, queue votes, playback, history, and chat. Connection
-presence and in-progress pause/skip votes reset safely; clients establish fresh
-presence when they reconnect. Without `REDIS_URL`, a restart or deployment
+Rooms always operate in the Node process. The optional `REDIS_URL` adapter saves
+whole-room records and can recover a single stopped process on a later cold
+start. It restores membership credentials, queue votes, playback, history, and
+chat; connection presence and in-progress pause/skip votes reset so clients
+establish fresh presence when they reconnect. Redis must be private,
+TLS-protected, and dedicated because those records include temporary bearer
+credentials.
+
+The adapter does not yet provide leases, compare-and-set revisions, pub/sub, or
+cross-instance routing. Do not enable it during rolling deployments or with
+multiple server processes: overlapping owners could serve divergent room state
+and overwrite one another. Production remains memory-only until coordinated
+room ownership is implemented. Without `REDIS_URL`, a restart or deployment
 removes every room.
 
 Disconnected rooms are pruned after six hours of inactivity to prevent
@@ -307,10 +321,10 @@ disconnect keeps the membership so the same token can reconnect and resume the
 session.
 
 This is suitable for an MVP where rooms are temporary. Durable production
-architecture should use:
+architecture still needs:
 
-- Redis pub/sub for multi-instance fan-out (single-instance persistence is
-  already supported).
+- coordinated room ownership plus Redis revisions/pub/sub for rolling or
+  multi-instance fan-out;
 - PostgreSQL for accounts, moderation, and durable history.
 - Signed short-lived access tokens for registered accounts.
 
@@ -346,7 +360,8 @@ recommended for a production launch.
 - Request sizes, message sizes, room sizes, and request rates are bounded.
 - Unexpected server exceptions are logged server-side but returned as a generic
   error rather than leaking internals.
-- The server stores display names and temporary room state only in memory.
+- Current production stores display names and temporary room state only in
+  memory; the experimental Redis adapter remains disabled.
 - The app does not request storage, microphone, contacts, or location access.
 
 Before a public store release, add a privacy policy, terms, abuse moderation,

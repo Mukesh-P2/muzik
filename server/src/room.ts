@@ -14,11 +14,13 @@ import type {
 const PLAY_LEAD_MS = 1_200;
 const CONTROL_LEAD_MS = 500;
 const MAX_QUEUE_ITEMS = 100;
+const MAX_QUEUE_IMPORT_ITEMS = 50;
 const MAX_HISTORY_ITEMS = 50;
 const MAX_CHAT_MESSAGES = 100;
 const MAX_CHAT_MESSAGE_LENGTH = 500;
 const CHAT_COOLDOWN_MS = 750;
 const MAX_POSITION_MS = 24 * 60 * 60 * 1_000;
+const MAX_INCREMENTING_COUNTER = 1_000_000_000_000;
 const PAUSE_VOTE_TTL_MS = 10_000;
 
 interface PauseVote {
@@ -97,22 +99,33 @@ export class Room {
     room.lastActivityAt = value.lastActivityAt;
     for (const member of value.members) {
       room.members.set(member.id, {
-        ...member,
+        id: member.id,
+        token: member.token,
+        displayName: member.displayName,
+        isHost: member.isHost,
         connected: false,
+        joinedAt: member.joinedAt,
+        songsAddedCount: member.songsAddedCount,
         pauseVoteCapable: false,
       });
     }
     for (const item of value.queue) {
       room.queue.set(item.id, {
-        ...item,
+        id: item.id,
         video: validateVideo(item.video),
+        addedBy: item.addedBy,
+        ...(item.addedByName === undefined ? {} : { addedByName: item.addedByName }),
+        addedAt: item.addedAt,
         votes: new Set(item.votes.filter((memberId) => room.members.has(memberId))),
+        orderKey: item.orderKey,
       });
     }
-    room.history.push(...value.history);
-    room.chat.push(...value.chat.slice(-MAX_CHAT_MESSAGES));
-    room.playback = value.playback;
-    room.currentPlaybackItem = value.currentPlaybackItem;
+    room.history.push(...value.history.map(canonicalHistoryItem));
+    room.chat.push(...value.chat.slice(-MAX_CHAT_MESSAGES).map(canonicalChatMessage));
+    room.playback = canonicalPlaybackState(value.playback);
+    room.currentPlaybackItem = value.currentPlaybackItem
+      ? canonicalHistoryItem(value.currentPlaybackItem)
+      : undefined;
     room.forcedNextItemId = value.forcedNextItemId && room.queue.has(value.forcedNextItemId)
       ? value.forcedNextItemId
       : undefined;
@@ -242,6 +255,54 @@ export class Room {
     member.songsAddedCount += 1;
     this.touch();
     return item;
+  }
+
+  addManyToQueue(
+    memberId: string,
+    videos: readonly VideoSummary[],
+    startPlayback = false,
+    now = Date.now(),
+  ): QueueItem[] {
+    const member = this.requireMember(memberId);
+    if (!Array.isArray(videos) || videos.length < 1 || videos.length > MAX_QUEUE_IMPORT_ITEMS) {
+      throw new RoomError(`Playlist imports must contain 1 to ${MAX_QUEUE_IMPORT_ITEMS} videos`);
+    }
+    if (startPlayback && !member.isHost) {
+      throw new RoomError("Host permission required", 403);
+    }
+    if (startPlayback && (this.playback.video !== null || this.playback.status !== "idle")) {
+      throw new RoomError("Playback must be idle to start an imported playlist", 409);
+    }
+    if (this.queue.size + videos.length > MAX_QUEUE_ITEMS) {
+      throw new RoomError("The playlist does not fit in the room queue", 409);
+    }
+
+    const cleanVideos = videos.map(validateVideo);
+    const seenVideoIds = new Set(
+      [...this.queue.values()].map((item) => item.video.videoId),
+    );
+    if (this.playback.video) seenVideoIds.add(this.playback.video.videoId);
+    for (const video of cleanVideos) {
+      if (seenVideoIds.has(video.videoId)) {
+        throw new RoomError("Playlist contains a video that is already in this room", 409);
+      }
+      seenVideoIds.add(video.videoId);
+    }
+
+    const items = cleanVideos.map<QueueItem>((video) => ({
+      id: randomUUID(),
+      video,
+      addedBy: memberId,
+      addedByName: member.displayName,
+      addedAt: now,
+      votes: new Set([memberId]),
+      orderKey: this.nextOrderKey++,
+    }));
+    for (const item of items) this.queue.set(item.id, item);
+    member.songsAddedCount += items.length;
+    if (startPlayback) this.playNext(now);
+    this.touch(now);
+    return items;
   }
 
   setVote(memberId: string, itemId: string, enabled: boolean): void {
@@ -789,47 +850,214 @@ export class RoomManager {
 }
 
 function isStoredRoomState(value: unknown): value is StoredRoomStateV1 {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  if (!isRecord(value)) return false;
   const state = value as Partial<StoredRoomStateV1>;
   return state.version === 1 &&
     typeof state.code === "string" && /^[A-Z0-9]{6,8}$/.test(state.code) &&
-    typeof state.createdAt === "number" && Number.isFinite(state.createdAt) &&
-    typeof state.lastActivityAt === "number" && Number.isFinite(state.lastActivityAt) &&
-    Array.isArray(state.members) &&
-    state.members.every(isStoredMember) &&
-    Array.isArray(state.queue) &&
-    state.queue.every(isStoredQueueItem) &&
-    Array.isArray(state.history) &&
-    Array.isArray(state.chat) &&
-    state.playback !== null && typeof state.playback === "object" &&
-    Array.isArray(state.mutedMemberIds) && state.mutedMemberIds.every(isString) &&
-    typeof state.nextOrderKey === "number" && Number.isFinite(state.nextOrderKey);
+    isNonNegativeSafeInteger(state.createdAt) &&
+    isNonNegativeSafeInteger(state.lastActivityAt) &&
+    state.lastActivityAt >= state.createdAt &&
+    isBoundedUniqueArray(state.members, 50, isStoredMember, (member) => member.id) &&
+    state.members.filter((member) => member.isHost).length <= 1 &&
+    isBoundedUniqueArray(state.queue, MAX_QUEUE_ITEMS, isStoredQueueItem, (item) => item.id) &&
+    isBoundedArray(state.history, MAX_HISTORY_ITEMS, isStoredHistoryItem) &&
+    isBoundedUniqueArray(state.chat, MAX_CHAT_MESSAGES, isStoredChatMessage, (message) => message.id) &&
+    isStoredPlaybackState(state.playback) &&
+    (state.currentPlaybackItem === undefined || isStoredHistoryItem(state.currentPlaybackItem)) &&
+    isConsistentStoredPlayback(state.playback, state.currentPlaybackItem) &&
+    (state.forcedNextItemId === undefined ||
+      (typeof state.forcedNextItemId === "string" &&
+        state.queue.some((item) => item.id === state.forcedNextItemId))) &&
+    isBoundedUniqueArray(state.mutedMemberIds, 50, isString, (memberId) => memberId) &&
+    state.mutedMemberIds.every((memberId) => state.members!.some((member) => member.id === memberId)) &&
+    isIncrementingCounter(state.nextOrderKey) &&
+    state.queue.every((item) =>
+      item.votes.every((memberId) => state.members!.some((member) => member.id === memberId))
+    ) &&
+    hasConsistentStoredReferences(state as StoredRoomStateV1);
 }
 
 function isStoredMember(value: unknown): value is Member {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  if (!isRecord(value)) return false;
   const member = value as Partial<Member>;
-  return typeof member.id === "string" && member.id.length > 0 &&
-    typeof member.token === "string" && member.token.length > 0 &&
-    typeof member.displayName === "string" && member.displayName.length > 0 &&
+  return isBoundedString(member.id, 1, 100) &&
+    isBoundedString(member.token, 1, 200) &&
+    isBoundedString(member.displayName, 1, 40) &&
     typeof member.isHost === "boolean" &&
     typeof member.connected === "boolean" &&
-    typeof member.joinedAt === "number" && Number.isFinite(member.joinedAt) &&
-    typeof member.songsAddedCount === "number" && Number.isFinite(member.songsAddedCount) &&
+    isNonNegativeSafeInteger(member.joinedAt) &&
+    isIncrementingCounter(member.songsAddedCount) &&
     typeof member.pauseVoteCapable === "boolean";
 }
 
 function isStoredQueueItem(
   value: unknown,
 ): value is Omit<QueueItem, "votes"> & { votes: string[] } {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  if (!isRecord(value)) return false;
   const item = value as Partial<Omit<QueueItem, "votes"> & { votes: string[] }>;
-  return typeof item.id === "string" && item.id.length > 0 &&
-    item.video !== null && typeof item.video === "object" &&
-    typeof item.addedBy === "string" &&
-    typeof item.addedAt === "number" && Number.isFinite(item.addedAt) &&
-    typeof item.orderKey === "number" && Number.isFinite(item.orderKey) &&
-    Array.isArray(item.votes) && item.votes.every(isString);
+  return isBoundedString(item.id, 1, 100) &&
+    isStoredVideo(item.video) &&
+    isBoundedString(item.addedBy, 1, 100) &&
+    (item.addedByName === undefined || isBoundedString(item.addedByName, 1, 40)) &&
+    isNonNegativeSafeInteger(item.addedAt) &&
+    isIncrementingCounter(item.orderKey) &&
+    isBoundedUniqueArray(item.votes, 50, isString, (memberId) => memberId);
+}
+
+function isStoredHistoryItem(value: unknown): value is HistoryItem {
+  if (!isRecord(value)) return false;
+  const item = value as Partial<HistoryItem>;
+  return isBoundedString(item.id, 1, 100) &&
+    isStoredVideo(item.video) &&
+    isBoundedString(item.addedBy, 1, 100) &&
+    (item.addedByName === undefined || isBoundedString(item.addedByName, 1, 40)) &&
+    isNonNegativeSafeInteger(item.addedAt) &&
+    isNonNegativeSafeInteger(item.playedAt);
+}
+
+function isStoredChatMessage(value: unknown): value is ChatMessage {
+  if (!isRecord(value)) return false;
+  const message = value as Partial<ChatMessage>;
+  return isBoundedString(message.id, 1, 100) &&
+    isBoundedString(message.memberId, 1, 100) &&
+    isBoundedString(message.displayName, 1, 40) &&
+    isBoundedString(message.text, 1, MAX_CHAT_MESSAGE_LENGTH) &&
+    isNonNegativeSafeInteger(message.sentAt);
+}
+
+function isStoredPlaybackState(value: unknown): value is PlaybackState {
+  if (!isRecord(value)) return false;
+  const playback = value as Partial<PlaybackState>;
+  return (playback.video === null || isStoredVideo(playback.video)) &&
+    (playback.status === "idle" || playback.status === "playing" || playback.status === "paused") &&
+    isNonNegativeSafeInteger(playback.positionMs) && playback.positionMs <= MAX_POSITION_MS &&
+    isNonNegativeSafeInteger(playback.anchorServerTimeMs) &&
+    isIncrementingCounter(playback.revision) &&
+    (playback.addedBy === undefined || isBoundedString(playback.addedBy, 1, 100)) &&
+    (playback.addedByName === undefined || isBoundedString(playback.addedByName, 1, 40));
+}
+
+function isConsistentStoredPlayback(
+  playback: PlaybackState,
+  currentItem: HistoryItem | undefined,
+): boolean {
+  if (playback.status === "idle") {
+    return playback.video === null &&
+      currentItem === undefined &&
+      playback.addedBy === undefined &&
+      playback.addedByName === undefined;
+  }
+  return playback.video !== null &&
+    currentItem !== undefined &&
+    sameVideo(currentItem.video, playback.video) &&
+    currentItem.addedBy === playback.addedBy &&
+    currentItem.addedByName === playback.addedByName;
+}
+
+function hasConsistentStoredReferences(state: StoredRoomStateV1): boolean {
+  const queueItemIds = state.queue.map((item) => item.id);
+  const historyItemIds = state.history.map((item) => item.id);
+  const allArchivedAndQueuedIds = [...queueItemIds, ...historyItemIds];
+  if (new Set(allArchivedAndQueuedIds).size !== allArchivedAndQueuedIds.length) return false;
+  if (
+    state.currentPlaybackItem &&
+    allArchivedAndQueuedIds.includes(state.currentPlaybackItem.id)
+  ) return false;
+
+  const queueVideoIds = state.queue.map((item) => item.video.videoId);
+  if (new Set(queueVideoIds).size !== queueVideoIds.length) return false;
+  if (state.playback.video && queueVideoIds.includes(state.playback.video.videoId)) return false;
+
+  const orderKeys = state.queue.map((item) => item.orderKey);
+  if (new Set(orderKeys).size !== orderKeys.length) return false;
+  return orderKeys.every((orderKey) => orderKey < state.nextOrderKey);
+}
+
+function sameVideo(left: VideoSummary, right: VideoSummary): boolean {
+  return left.videoId === right.videoId &&
+    left.title === right.title &&
+    left.channelTitle === right.channelTitle &&
+    left.thumbnailUrl === right.thumbnailUrl &&
+    left.durationMs === right.durationMs;
+}
+
+function canonicalHistoryItem(item: HistoryItem): HistoryItem {
+  return {
+    id: item.id,
+    video: validateVideo(item.video),
+    addedBy: item.addedBy,
+    ...(item.addedByName === undefined ? {} : { addedByName: item.addedByName }),
+    addedAt: item.addedAt,
+    playedAt: item.playedAt,
+  };
+}
+
+function canonicalChatMessage(message: ChatMessage): ChatMessage {
+  return {
+    id: message.id,
+    memberId: message.memberId,
+    displayName: message.displayName,
+    text: message.text,
+    sentAt: message.sentAt,
+  };
+}
+
+function canonicalPlaybackState(playback: PlaybackState): PlaybackState {
+  return {
+    video: playback.video ? validateVideo(playback.video) : null,
+    status: playback.status,
+    positionMs: playback.positionMs,
+    anchorServerTimeMs: playback.anchorServerTimeMs,
+    revision: playback.revision,
+    ...(playback.addedBy === undefined ? {} : { addedBy: playback.addedBy }),
+    ...(playback.addedByName === undefined ? {} : { addedByName: playback.addedByName }),
+  };
+}
+
+function isStoredVideo(value: unknown): value is VideoSummary {
+  if (!isRecord(value)) return false;
+  const video = value as Partial<VideoSummary>;
+  return typeof video.videoId === "string" && /^[A-Za-z0-9_-]{11}$/.test(video.videoId) &&
+    isBoundedString(video.title, 1, 200) &&
+    isBoundedString(video.channelTitle, 0, 100) &&
+    isBoundedString(video.thumbnailUrl, 0, 500) &&
+    (video.durationMs === undefined ||
+      (isNonNegativeSafeInteger(video.durationMs) && video.durationMs <= MAX_POSITION_MS));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isIncrementingCounter(value: unknown): value is number {
+  return isNonNegativeSafeInteger(value) && value <= MAX_INCREMENTING_COUNTER;
+}
+
+function isBoundedString(value: unknown, minimum: number, maximum: number): value is string {
+  return typeof value === "string" && value.length >= minimum && value.length <= maximum;
+}
+
+function isBoundedArray<T>(
+  value: unknown,
+  maximum: number,
+  predicate: (item: unknown) => item is T,
+): value is T[] {
+  return Array.isArray(value) && value.length <= maximum && value.every(predicate);
+}
+
+function isBoundedUniqueArray<T>(
+  value: unknown,
+  maximum: number,
+  predicate: (item: unknown) => item is T,
+  key: (item: T) => string,
+): value is T[] {
+  if (!isBoundedArray(value, maximum, predicate)) return false;
+  const keys = value.map(key);
+  return new Set(keys).size === keys.length;
 }
 
 function isString(value: unknown): value is string {
@@ -841,18 +1069,33 @@ function pauseVoteThreshold(connectedCount: number): number {
 }
 
 function validateVideo(video: VideoSummary): VideoSummary {
-  if (!video || !/^[A-Za-z0-9_-]{11}$/.test(video.videoId ?? "")) {
+  if (
+    !isRecord(video) ||
+    typeof video.videoId !== "string" ||
+    !/^[A-Za-z0-9_-]{11}$/.test(video.videoId)
+  ) {
     throw new RoomError("A valid YouTube video ID is required");
   }
-  const title = String(video.title ?? "").trim().slice(0, 200);
+  if (
+    typeof video.title !== "string" ||
+    typeof video.channelTitle !== "string" ||
+    typeof video.thumbnailUrl !== "string" ||
+    (video.durationMs !== undefined &&
+      (typeof video.durationMs !== "number" ||
+        !Number.isFinite(video.durationMs) ||
+        video.durationMs < 0))
+  ) {
+    throw new RoomError("Valid YouTube video metadata is required");
+  }
+  const title = video.title.trim().slice(0, 200);
   if (!title) throw new RoomError("Video title is required");
   const cleanVideo: VideoSummary = {
     videoId: video.videoId,
     title,
-    channelTitle: String(video.channelTitle ?? "").trim().slice(0, 100),
-    thumbnailUrl: String(video.thumbnailUrl ?? "").trim().slice(0, 500),
+    channelTitle: video.channelTitle.trim().slice(0, 100),
+    thumbnailUrl: video.thumbnailUrl.trim().slice(0, 500),
   };
-  if (typeof video.durationMs === "number" && Number.isFinite(video.durationMs) && video.durationMs >= 0) {
+  if (video.durationMs !== undefined) {
     cleanVideo.durationMs = Math.round(Math.min(video.durationMs, MAX_POSITION_MS));
   }
   return cleanVideo;

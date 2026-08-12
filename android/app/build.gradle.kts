@@ -1,3 +1,5 @@
+import java.net.URI
+import java.net.URISyntaxException
 import java.util.Properties
 import org.gradle.api.GradleException
 
@@ -12,8 +14,46 @@ val localProperties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) file.inputStream().use(::load)
 }
-val muzikServerUrl = providers.gradleProperty("MUZIK_SERVER_URL")
-    .orElse(localProperties.getProperty("MUZIK_SERVER_URL") ?: "http://10.0.2.2:8080")
+val configuredMuzikServerUrl = (
+    providers.gradleProperty("MUZIK_SERVER_URL").orNull
+        ?: localProperties.getProperty("MUZIK_SERVER_URL")
+    )
+    ?.trim()
+    ?.takeIf(String::isNotEmpty)
+val debugMuzikServerUrl = configuredMuzikServerUrl ?: "http://10.0.2.2:8080"
+val releaseMuzikServerUrl = configuredMuzikServerUrl.orEmpty()
+
+fun buildConfigString(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
+val validateReleaseServerUrl = tasks.register("validateReleaseServerUrl") {
+    group = "verification"
+    description = "Validates the explicit HTTPS server URL required by release builds."
+    inputs.property("muzikServerUrl", releaseMuzikServerUrl)
+
+    doLast {
+        val value = configuredMuzikServerUrl ?: throw GradleException(
+            "Release builds require an explicit MUZIK_SERVER_URL. Set it with " +
+                "-PMUZIK_SERVER_URL=https://..., ORG_GRADLE_PROJECT_MUZIK_SERVER_URL, " +
+                "or android/local.properties.",
+        )
+        val uri = try {
+            URI(value)
+        } catch (_: URISyntaxException) {
+            null
+        }
+        if (
+            uri == null ||
+            !uri.isAbsolute ||
+            !uri.scheme.equals("https", ignoreCase = true) ||
+            uri.host.isNullOrBlank()
+        ) {
+            throw GradleException(
+                "Release MUZIK_SERVER_URL must be an absolute HTTPS URL; received '$value'.",
+            )
+        }
+    }
+}
 
 fun releaseSigningValue(name: String): String? = providers.gradleProperty(name)
     .orElse(providers.environmentVariable(name))
@@ -49,7 +89,6 @@ android {
         versionCode = 2
         versionName = "0.2.0"
 
-        buildConfigField("String", "SERVER_URL", "\"${muzikServerUrl.get()}\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -66,9 +105,11 @@ android {
 
     buildTypes {
         debug {
+            buildConfigField("String", "SERVER_URL", buildConfigString(debugMuzikServerUrl))
             manifestPlaceholders["usesCleartextTraffic"] = "true"
         }
         release {
+            buildConfigField("String", "SERVER_URL", buildConfigString(releaseMuzikServerUrl))
             isMinifyEnabled = true
             signingConfig = signingConfigs.findByName("release")
             manifestPlaceholders["usesCleartextTraffic"] = "false"
@@ -95,6 +136,12 @@ android {
 
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+    }
+}
+
+tasks.configureEach {
+    if (name != validateReleaseServerUrl.name && name.contains("Release")) {
+        dependsOn(validateReleaseServerUrl)
     }
 }
 

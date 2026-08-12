@@ -27,6 +27,8 @@ jobs:
 
   android:
     runs-on: ubuntu-latest
+    env:
+      ORG_GRADLE_PROJECT_MUZIK_SERVER_URL: https://muzik-server-oshx.onrender.com
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4

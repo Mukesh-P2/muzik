@@ -43,6 +43,20 @@ data class ChatMessage(
 )
 
 @Serializable
+data class ChatMessageEnvelope(
+    val type: String,
+    val message: ChatMessage,
+)
+
+@Serializable
+data class QueueImportResultEnvelope(
+    val type: String,
+    val requestId: String,
+    val addedCount: Int,
+    val startedPlayback: Boolean,
+)
+
+@Serializable
 data class Me(
     val id: String,
     val displayName: String,

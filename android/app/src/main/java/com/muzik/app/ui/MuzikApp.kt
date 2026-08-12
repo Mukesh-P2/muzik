@@ -204,6 +204,34 @@ fun MuzikApp(
             isInPictureInPictureMode = isInPictureInPictureMode,
         )
     }
+    state.pendingInviteCode?.takeIf { state.membership != null }?.let { roomCode ->
+        InvitedRoomDialog(
+            roomCode = roomCode,
+            onDismiss = viewModel::dismissInvite,
+            onConfirm = viewModel::switchToInvitedRoom,
+        )
+    }
+}
+
+@Composable
+private fun InvitedRoomDialog(
+    roomCode: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Open room $roomCode?") },
+        text = {
+            Text("You are already in another room. Leave it and prepare to join room $roomCode?")
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Stay here") }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Leave and open") }
+        },
+    )
 }
 
 @Composable
@@ -749,8 +777,7 @@ private fun RoomContent(
                         onValueChange = { chatDraft = it.take(500) },
                         onSend = {
                             val message = chatDraft.trim()
-                            if (message.isNotEmpty()) {
-                                viewModel.sendChat(message)
+                            if (message.isNotEmpty() && viewModel.sendChat(message)) {
                                 chatDraft = ""
                             }
                         },

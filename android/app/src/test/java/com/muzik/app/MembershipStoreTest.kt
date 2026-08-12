@@ -66,6 +66,67 @@ class MembershipStoreTest {
         assertNull(store.membership)
         assertNull(viewModel.uiState.value.membership)
     }
+
+    @Test
+    fun inviteToAnotherRoomRequiresConfirmationBeforeLeaving() {
+        val membership = Membership(
+            roomCode = "ABC123",
+            memberId = "member-1",
+            memberToken = "secret-token",
+            displayName = "Listener",
+            isHost = false,
+        )
+        val store = RecordingMembershipStore(membership)
+        val viewModel = MuzikViewModel(
+            initialState = MuzikUiState(displayName = "Listener", membership = membership),
+            searchRequest = { _, _ -> error("Unused") },
+            membershipStore = store,
+        )
+
+        viewModel.handleInvite("xyz789")
+
+        assertEquals("XYZ789", viewModel.uiState.value.pendingInviteCode)
+        assertEquals(membership, viewModel.uiState.value.membership)
+        assertEquals(membership, store.membership)
+
+        viewModel.switchToInvitedRoom()
+
+        assertNull(store.membership)
+        assertNull(viewModel.uiState.value.membership)
+        assertNull(viewModel.uiState.value.pendingInviteCode)
+        assertEquals("XYZ789", viewModel.uiState.value.roomCodeInput)
+        assertEquals("Listener", viewModel.uiState.value.displayName)
+    }
+
+    @Test
+    fun inviteWithoutMembershipPrefillsTheJoinCode() {
+        val viewModel = MuzikViewModel(
+            initialState = MuzikUiState(),
+            searchRequest = { _, _ -> error("Unused") },
+        )
+
+        viewModel.handleInvite("abc-123")
+
+        assertEquals("ABC123", viewModel.uiState.value.roomCodeInput)
+        assertNull(viewModel.uiState.value.pendingInviteCode)
+    }
+
+    @Test
+    fun inviteDuringRoomRequestIsDeferredInsteadOfReplacingTheActiveRequest() {
+        val viewModel = MuzikViewModel(
+            initialState = MuzikUiState(
+                roomCodeInput = "OLD123",
+                loading = true,
+                roomRequest = RoomRequest.Join,
+            ),
+            searchRequest = { _, _ -> error("Unused") },
+        )
+
+        viewModel.handleInvite("new456")
+
+        assertEquals("OLD123", viewModel.uiState.value.roomCodeInput)
+        assertEquals("NEW456", viewModel.uiState.value.pendingInviteCode)
+    }
 }
 
 private class RecordingMembershipStore(

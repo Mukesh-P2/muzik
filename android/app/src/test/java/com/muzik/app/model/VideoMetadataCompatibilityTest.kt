@@ -43,6 +43,28 @@ class VideoMetadataCompatibilityTest {
     }
 
     @Test
+    fun decodesStandaloneChatMessageEvent() {
+        val envelope = json.decodeFromString<ChatMessageEnvelope>(
+            """{"type":"chat_message","message":{"id":"chat-1","memberId":"member-1","displayName":"Listener","text":"Hello","sentAt":123}}""",
+        )
+
+        assertEquals("chat_message", envelope.type)
+        assertEquals("chat-1", envelope.message.id)
+        assertEquals("Hello", envelope.message.text)
+    }
+
+    @Test
+    fun decodesPlaylistImportResult() {
+        val envelope = json.decodeFromString<QueueImportResultEnvelope>(
+            """{"type":"queue_import_result","requestId":"request-1","addedCount":12,"startedPlayback":true}""",
+        )
+
+        assertEquals("request-1", envelope.requestId)
+        assertEquals(12, envelope.addedCount)
+        assertTrue(envelope.startedPlayback)
+    }
+
+    @Test
     fun decodesLegacySnapshotWithoutHistoryAttributionCountsOrPauseVote() {
         val snapshot = json.decodeFromString<RoomSnapshot>(
             """

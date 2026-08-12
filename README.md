@@ -46,7 +46,7 @@ Create `server/.env` from `server/.env.example` and configure:
 PORT=8080
 YOUTUBE_API_KEY=your_server_side_youtube_api_key
 ALLOWED_ORIGIN=*
-REDIS_URL=redis://default:password@host:6379
+REDIS_URL=rediss://default:password@host:6379
 ```
 
 | Variable | Required | Purpose |
@@ -54,7 +54,7 @@ REDIS_URL=redis://default:password@host:6379
 | `PORT` | No | HTTP/WebSocket port; defaults to `8080` |
 | `YOUTUBE_API_KEY` | For search | Server-only YouTube Data API credential |
 | `ALLOWED_ORIGIN` | No | Allowed HTTP origin |
-| `REDIS_URL` | No | Redis connection URL for durable room state; memory-only when omitted |
+| `REDIS_URL` | No | Experimental single-process cold-start recovery; memory-only when omitted |
 
 Keep `.env`, API keys, and credentials out of source control. The YouTube key
 must remain on the server and must never be compiled into the APK.
@@ -77,8 +77,8 @@ not configured.
 ## Android configuration
 
 Open `android/` as the Android Studio project. Android Studio normally creates
-`android/local.properties` with the local SDK path. The optional
-`MUZIK_SERVER_URL` property selects the backend:
+`android/local.properties` with the local SDK path. The `MUZIK_SERVER_URL`
+property selects the backend:
 
 ```properties
 MUZIK_SERVER_URL=https://your-muzik-service.onrender.com
@@ -88,10 +88,17 @@ Useful development URLs:
 
 - Android emulator to local server: `http://10.0.2.2:8080`
 - Physical device on the same network: the computer's LAN address
-- Release build: an HTTPS public server URL
+- Release build: an explicit absolute HTTPS public server URL
+
+Debug builds fall back to `http://10.0.2.2:8080` when the property is omitted.
+Release builds have no fallback: `MUZIK_SERVER_URL` must be supplied explicitly
+and must be an absolute `https://` URL. It may be set in `local.properties`,
+passed as `-PMUZIK_SERVER_URL=https://...`, or exposed to Gradle as
+`ORG_GRADLE_PROJECT_MUZIK_SERVER_URL`. The release build runs
+`validateReleaseServerUrl` before compiling or packaging.
 
 `MUZIK_SERVER_URL` is compiled into the APK. Changing it requires rebuilding
-and reinstalling the app. Release builds reject cleartext HTTP.
+and reinstalling the app.
 
 Build and test from `android/`:
 
@@ -137,15 +144,18 @@ For any shared Android/server change:
 3. Verify server health and WebSocket behavior.
 4. Distribute the new APK afterward.
 
-The server must recognize messages such as `queue_reorder` before an APK that
-sends them is distributed; otherwise that APK receives `Unknown message type`.
+The server must recognize messages such as `queue_reorder` and `queue_add_many`
+before an APK that sends them is distributed; otherwise that APK receives
+`Unknown message type`.
 
 ## Production constraints
 
 - Render automatically deploys pushes to the configured production branch.
-- Room state is memory-only when `REDIS_URL` is absent, so a restart or
-  deployment then clears all active rooms. With Redis configured, room data is
-  restored while live presence is reset until clients reconnect.
+- Production room state is currently memory-only, so a restart or deployment
+  clears all active rooms. The optional Redis adapter can recover a single
+  stopped process on a cold start, but it is not safe for rolling deployments
+  or multiple instances until coordinated ownership/revisions and pub/sub are
+  implemented; do not enable it in that topology.
 - Render must receive `YOUTUBE_API_KEY` through its secret environment settings.
 - A server URL change requires a newly built APK.
 - Signing credentials, local properties, and environment files must not be

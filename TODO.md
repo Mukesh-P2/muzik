@@ -35,9 +35,10 @@
 
 ## Future improvements
 
-- [x] Add optional Redis-backed room persistence and safe presence restoration.
-  Production remains memory-only until a Redis service is provisioned and its
-  `REDIS_URL` is configured in Render.
+- [ ] Finish production-safe Redis-backed room persistence.
+  A cold-start adapter and safe presence reset exist, but production remains
+  memory-only. Add coordinated ownership/revisions and pub/sub before setting
+  `REDIS_URL` during rolling deployments or on multiple instances.
 - [ ] Add accounts and durable data with PostgreSQL.
   Resume only after choosing Google sign-in, email magic links, or intentionally
   remaining guest-only; this decision changes APIs, stored personal data, and

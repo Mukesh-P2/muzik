@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.muzik.app.model.ConnectionStatus
+import com.muzik.app.model.ChatMessage
 import com.muzik.app.model.Membership
 import com.muzik.app.model.RoomSnapshot
 import com.muzik.app.model.SearchResponse
@@ -13,6 +14,7 @@ import com.muzik.app.network.MuzikClient
 import com.muzik.app.network.RoomConnection
 import io.ktor.client.plugins.ResponseException
 import io.ktor.client.statement.bodyAsText
+import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
@@ -29,6 +31,7 @@ enum class RoomRequest { Create, Join }
 data class MuzikUiState(
     val displayName: String = "",
     val roomCodeInput: String = "",
+    val pendingInviteCode: String? = null,
     val membership: Membership? = null,
     val room: RoomSnapshot? = null,
     val connectionStatus: ConnectionStatus = ConnectionStatus.Disconnected,
@@ -52,6 +55,7 @@ class MuzikViewModel private constructor(
     private val clientFactory: () -> MuzikClient,
     private val searchRequest: (suspend (String, Membership) -> SearchResponse)?,
     private val playlistRequest: (suspend (String, Membership) -> SearchResponse)?,
+    private val chatSendRequest: ((String) -> Boolean)?,
     private val membershipStore: MembershipStore,
     initialState: MuzikUiState,
     restoreConnection: Boolean,
@@ -60,6 +64,7 @@ class MuzikViewModel private constructor(
         clientFactory = { MuzikClient() },
         searchRequest = null,
         playlistRequest = null,
+        chatSendRequest = null,
         membershipStore = bootstrap.store,
         initialState = MuzikUiState(
             displayName = bootstrap.membership?.displayName.orEmpty(),
@@ -72,11 +77,13 @@ class MuzikViewModel private constructor(
         initialState: MuzikUiState,
         searchRequest: suspend (String, Membership) -> SearchResponse,
         playlistRequest: (suspend (String, Membership) -> SearchResponse)? = null,
+        chatSendRequest: ((String) -> Boolean)? = null,
         membershipStore: MembershipStore = NoOpMembershipStore,
     ) : this(
         clientFactory = { error("The test client should not be used") },
         searchRequest = searchRequest,
         playlistRequest = playlistRequest,
+        chatSendRequest = chatSendRequest,
         membershipStore = membershipStore,
         initialState = initialState,
         restoreConnection = false,
@@ -91,6 +98,7 @@ class MuzikViewModel private constructor(
     private var searchJob: Job? = null
     private var searchGeneration = 0L
     private var playlistJob: Job? = null
+    private var pendingPlaylistImport: PendingPlaylistImport? = null
 
     init {
         if (restoreConnection) initialState.membership?.let(::connect)
@@ -113,8 +121,24 @@ class MuzikViewModel private constructor(
 
     fun setDisplayName(value: String) = _uiState.update { it.copy(displayName = value.take(40)) }
     fun setRoomCode(value: String) = _uiState.update {
-        it.copy(roomCodeInput = value.filter(Char::isLetterOrDigit).uppercase().take(8))
+        it.copy(roomCodeInput = normalizeRoomCode(value))
     }
+    fun handleInvite(value: String) {
+        val roomCode = normalizeRoomCode(value)
+        if (roomCode.isEmpty()) return
+        _uiState.update { current ->
+            when {
+                current.loading -> current.copy(pendingInviteCode = roomCode)
+                current.membership == null -> current.copy(roomCodeInput = roomCode)
+                current.membership.roomCode.equals(roomCode, ignoreCase = true) -> current.copy(
+                    pendingInviteCode = null,
+                    notice = "You are already in room $roomCode",
+                )
+                else -> current.copy(pendingInviteCode = roomCode)
+            }
+        }
+    }
+    fun dismissInvite() = _uiState.update { it.copy(pendingInviteCode = null) }
     fun setSearchQuery(value: String) {
         val nextQuery = value.take(100)
         if (_uiState.value.searchQuery == nextQuery) return
@@ -161,13 +185,28 @@ class MuzikViewModel private constructor(
             try {
                 val membership = request()
                 membershipStore.save(membership)
-                _uiState.update {
-                    it.copy(loading = false, roomRequest = null, membership = membership)
+                _uiState.update { current ->
+                    val pendingInvite = current.pendingInviteCode?.takeUnless { roomCode ->
+                        membership.roomCode.equals(roomCode, ignoreCase = true)
+                    }
+                    current.copy(
+                        loading = false,
+                        roomRequest = null,
+                        membership = membership,
+                        pendingInviteCode = pendingInvite,
+                    )
                 }
                 connect(membership)
             } catch (error: Exception) {
-                _uiState.update {
-                    it.copy(loading = false, roomRequest = null, error = readableError(error))
+                val message = readableError(error)
+                _uiState.update { current ->
+                    current.copy(
+                        loading = false,
+                        roomRequest = null,
+                        roomCodeInput = current.pendingInviteCode ?: current.roomCodeInput,
+                        pendingInviteCode = null,
+                        error = message,
+                    )
                 }
             }
         }
@@ -194,13 +233,74 @@ class MuzikViewModel private constructor(
                     )
                 }
             },
+            onChatMessage = chat@{ message ->
+                if (connection !== newConnection) return@chat
+                _uiState.update { current ->
+                    val room = current.room ?: return@update current
+                    current.copy(room = appendChatMessage(room, message))
+                }
+            },
+            onQueueImportResult = result@{ result ->
+                if (connection !== newConnection) return@result
+                val pending = pendingPlaylistImport
+                if (pending?.requestId != result.requestId) return@result
+                pendingPlaylistImport = null
+                _uiState.update {
+                    it.copy(
+                        importingPlaylist = false,
+                        playlistInput = "",
+                        playerConsent = it.playerConsent || result.startedPlayback,
+                        notice = "Imported ${result.addedCount} playlist videos",
+                    )
+                }
+            },
+            onActionError = actionError@{ requestId, message ->
+                if (connection !== newConnection) return@actionError
+                if (pendingPlaylistImport?.requestId == requestId) {
+                    pendingPlaylistImport = null
+                    _uiState.update {
+                        it.copy(importingPlaylist = false, error = message)
+                    }
+                } else {
+                    showError(message)
+                }
+            },
             onStatus = status@{ status ->
                 if (connection !== newConnection) return@status
-                _uiState.update { it.copy(connectionStatus = status) }
+                val importInterrupted = status == ConnectionStatus.Disconnected &&
+                    pendingPlaylistImport != null
+                if (importInterrupted) pendingPlaylistImport = null
+                _uiState.update {
+                    it.copy(
+                        connectionStatus = status,
+                        importingPlaylist = if (importInterrupted) false else it.importingPlaylist,
+                        error = if (importInterrupted) {
+                            "Connection changed during playlist import; check the queue before retrying"
+                        } else {
+                            it.error
+                        },
+                    )
+                }
             },
             onClockOffset = clock@{ offset ->
                 if (connection !== newConnection) return@clock
                 _uiState.update { it.copy(clockOffsetMs = offset) }
+            },
+            onMembershipInvalid = invalid@{
+                if (connection !== newConnection) return@invalid
+                cancelSearchRequest()
+                playlistJob?.cancel()
+                playlistJob = null
+                pendingPlaylistImport = null
+                membershipStore.clear()
+                connection = null
+                _uiState.update { current ->
+                    MuzikUiState(
+                        displayName = current.displayName,
+                        roomCodeInput = current.pendingInviteCode ?: current.roomCodeInput,
+                        error = "This room is no longer available. Create or join a room again.",
+                    )
+                }
             },
             onError = error@{ message ->
                 if (connection !== newConnection) return@error
@@ -284,6 +384,10 @@ class MuzikViewModel private constructor(
             showError("Join a room before importing a playlist")
             return
         }
+        if (state.connectionStatus != ConnectionStatus.Connected) {
+            showError("Wait for the room to reconnect before importing a playlist")
+            return
+        }
         val value = state.playlistInput.trim()
         if (value.isEmpty()) {
             showError("Enter a YouTube playlist URL or ID")
@@ -295,25 +399,58 @@ class MuzikViewModel private constructor(
                 val response = playlistRequest?.invoke(value, membership)
                     ?: client.importPlaylist(value, membership)
                 val current = _uiState.value
+                if (
+                    current.membership?.memberId != membership.memberId ||
+                    current.connectionStatus != ConnectionStatus.Connected
+                ) {
+                    _uiState.update {
+                        it.copy(
+                            importingPlaylist = false,
+                            error = "The room disconnected; reconnect and try the playlist again",
+                        )
+                    }
+                    return@launch
+                }
                 val selected = selectPlaylistImports(response.results, current.room)
+                if (selected.isEmpty()) {
+                    _uiState.update {
+                        it.copy(
+                            importingPlaylist = false,
+                            notice = "No new embeddable videos were available to import",
+                        )
+                    }
+                    return@launch
+                }
                 val startsPlayback = current.room?.me?.isHost == true &&
-                    current.room.playback.video == null && selected.isNotEmpty()
-                connection?.addManyToQueue(selected, startPlayback = startsPlayback)
-                _uiState.update {
-                    it.copy(
-                        importingPlaylist = false,
-                        playlistInput = if (selected.isEmpty()) it.playlistInput else "",
-                        playerConsent = it.playerConsent || startsPlayback,
-                        notice = if (selected.isEmpty()) {
-                            "No new embeddable videos were available to import"
-                        } else {
-                            "Importing ${selected.size} playlist videos"
-                        },
-                    )
+                    current.room.playback.video == null
+                val requestId = UUID.randomUUID().toString()
+                pendingPlaylistImport = PendingPlaylistImport(requestId)
+                val sent = connection?.addManyToQueue(
+                    requestId = requestId,
+                    videos = selected,
+                    startPlayback = startsPlayback,
+                ) == true
+                if (!sent) {
+                    if (pendingPlaylistImport?.requestId == requestId) {
+                        pendingPlaylistImport = null
+                    }
+                    _uiState.update {
+                        it.copy(
+                            importingPlaylist = false,
+                            error = "The room disconnected; reconnect and try the playlist again",
+                        )
+                    }
+                    return@launch
+                }
+                if (pendingPlaylistImport?.requestId == requestId) {
+                    _uiState.update {
+                        it.copy(notice = "Importing ${selected.size} playlist videos")
+                    }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
+                pendingPlaylistImport = null
                 val message = readableError(error)
                 _uiState.update { it.copy(importingPlaylist = false, error = message) }
             } finally {
@@ -365,9 +502,10 @@ class MuzikViewModel private constructor(
     fun next() = connection?.playback("next")
     fun seek(positionMs: Long) = connection?.playback("seek", positionMs)
     fun voteToSkip() = connection?.voteToSkip()
-    fun sendChat(text: String) {
+    fun sendChat(text: String): Boolean {
         val normalized = text.trim().take(500)
-        if (normalized.isNotEmpty()) connection?.sendChat(normalized)
+        if (normalized.isEmpty()) return false
+        return chatSendRequest?.invoke(normalized) ?: (connection?.sendChat(normalized) == true)
     }
     fun deleteChat(messageId: String) = connection?.deleteChat(messageId)
     fun setChatMuted(memberId: String, muted: Boolean) =
@@ -397,12 +535,30 @@ class MuzikViewModel private constructor(
         cancelSearchRequest()
         playlistJob?.cancel()
         playlistJob = null
+        pendingPlaylistImport = null
         membershipStore.clear()
         connection?.leave()
         connection = null
         _uiState.update {
             MuzikUiState(displayName = it.displayName)
         }
+    }
+
+    fun switchToInvitedRoom() {
+        val state = _uiState.value
+        val roomCode = state.pendingInviteCode ?: return
+        cancelSearchRequest()
+        playlistJob?.cancel()
+        playlistJob = null
+        pendingPlaylistImport = null
+        membershipStore.clear()
+        connection?.leave()
+        connection = null
+        _uiState.value = MuzikUiState(
+            displayName = state.displayName,
+            roomCodeInput = roomCode,
+            notice = "Ready to join room $roomCode",
+        )
     }
 
     private fun showError(message: String) = _uiState.update { it.copy(error = message) }
@@ -429,6 +585,7 @@ class MuzikViewModel private constructor(
     override fun onCleared() {
         cancelSearchRequest()
         playlistJob?.cancel()
+        pendingPlaylistImport = null
         connection?.disconnect()
         clientInstance?.close()
         super.onCleared()
@@ -449,6 +606,21 @@ internal fun selectPlaylistImports(
         .filterNot { it.videoId in existingVideoIds }
         .take(availableSlots)
 }
+
+internal fun appendChatMessage(
+    room: RoomSnapshot,
+    message: ChatMessage,
+): RoomSnapshot {
+    if (room.chat.any { existing -> existing.id == message.id }) return room
+    return room.copy(chat = (room.chat + message).takeLast(MAX_CHAT_MESSAGES))
+}
+
+private const val MAX_CHAT_MESSAGES = 100
+
+private data class PendingPlaylistImport(val requestId: String)
+
+private fun normalizeRoomCode(value: String): String =
+    value.filter(Char::isLetterOrDigit).uppercase().take(8)
 
 private data class MembershipBootstrap(
     val store: MembershipStore,
